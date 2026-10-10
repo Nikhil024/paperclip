@@ -25,11 +25,18 @@ When a heartbeat fires, Paperclip:
 | OpenCode | `opencode_local` | Runs OpenCode CLI locally (multi-provider `provider/model`) |
 | Cursor | `cursor` | Runs Cursor in background mode |
 | Pi | `pi_local` | Runs an embedded Pi agent locally |
+| Oh My Pi | `omp_local` | Runs the local Oh My Pi (`omp`) CLI, a Pi fork, through the Pi adapter |
 | Hermes | `hermes_local` | Runs the local Hermes CLI through `@paperclipai/hermes-paperclip-adapter` |
 | Hermes Gateway | `hermes_gateway` | Calls an already-running Hermes API server through `@paperclipai/hermes-paperclip-adapter/gateway` |
 | OpenClaw Gateway | `openclaw_gateway` | Connects to an OpenClaw gateway endpoint |
 | [Process](/adapters/process) | `process` | Executes arbitrary shell commands |
 | [HTTP](/adapters/http) | `http` | Sends webhooks to external agents |
+
+### Custom Base URL for Pi and Oh My Pi
+
+When you create a `pi_local` or `omp_local` agent, the new-agent screen has an optional **Base URL** field. Use it to route the agent's `provider/model` through your own OpenAI-compatible endpoint. The setting applies only to that agent. The API key you enter is stored as a company secret, and the agent config references it as `{env:KEY}`. Paperclip expands that reference on the server, and only from the agent's own environment. It never reads the Paperclip server's environment for this.
+
+With a custom provider, each run uses a temporary agent directory that Paperclip creates. The CLI does not use the host's `~/.pi` or `~/.omp` logins, config, or MCP servers for that run.
 
 ## Credential ownership for sandbox targets
 

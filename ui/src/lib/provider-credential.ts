@@ -10,6 +10,47 @@ export const PROVIDER_ENV_KEYS: Record<string, string> = {
   opencode: "OPENCODE_API_KEY",
 };
 
+/** Route a Pi provider/model through a custom OpenAI-compatible endpoint via
+ * PAPERCLIP_PI_PROVIDERS. The key is referenced as {env:VAR} and expanded
+ * server-side; never put a literal key here. */
+export function piCustomProviderEnv(
+  model: string,
+  baseUrl: string,
+  apiKeyEnv: string | null,
+  contextWindow: number | null = null,
+) {
+  // Without explicit limits omp borrows a fuzzy-matched catalog entry (often a
+  // ~1M window) and requests the remainder as output, which local servers
+  // reject. omp's own system prompt + tools is ~37k tokens and it compacts at
+  // window - max(15%, 16k), so 64k is the smallest default it runs in.
+  const ctx = contextWindow ?? 65536;
+  const url = baseUrl.trim();
+  const trimmed = model.trim();
+  const slash = trimmed.indexOf("/");
+  if (!url || slash <= 0 || slash === trimmed.length - 1) return null;
+  const provider = trimmed.slice(0, slash);
+  const modelId = trimmed.slice(slash + 1);
+  return {
+    PAPERCLIP_PI_PROVIDERS: {
+      type: "plain" as const,
+      value: JSON.stringify({
+        [provider]: {
+          baseUrl: url,
+          api: "openai-completions",
+          ...(apiKeyEnv ? { apiKey: `{env:${apiKeyEnv}}` } : {}),
+          models: [
+            {
+              id: modelId,
+              contextWindow: ctx,
+              maxTokens: Math.min(32768, Math.floor(ctx / 4)),
+            },
+          ],
+        },
+      }),
+    },
+  };
+}
+
 /** New organization credentials get a distinct key; never rotate another agent's secret. */
 export async function storeOrganizationApiKey(
   companyId: string,

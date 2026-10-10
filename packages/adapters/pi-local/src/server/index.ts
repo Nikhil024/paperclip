@@ -1,4 +1,14 @@
-import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
+import type {
+  AdapterEnvironmentTestContext,
+  AdapterExecutionContext,
+  AdapterSessionCodec,
+  AdapterSkillContext,
+} from "@paperclipai/adapter-utils";
+import { execute } from "./execute.js";
+import { listPiModels } from "./models.js";
+import { listPiSkills, syncPiSkills } from "./skills.js";
+import { testEnvironment } from "./test.js";
+import { OMP_VARIANT } from "./variant.js";
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -59,3 +69,12 @@ export {
   resetPiModelsCacheForTests,
 } from "./models.js";
 export { parsePiJsonl, isPiUnknownSessionError } from "./parse.js";
+export { OMP_VARIANT, PI_VARIANT, type PiVariant } from "./variant.js";
+
+// omp_local (Oh My Pi) runs through the same code with the omp variant.
+export const ompExecute = (ctx: AdapterExecutionContext) => execute(ctx, OMP_VARIANT);
+export const ompTestEnvironment = (ctx: AdapterEnvironmentTestContext) => testEnvironment(ctx, OMP_VARIANT);
+export const listOmpSkills = (ctx: AdapterSkillContext) => listPiSkills(ctx, OMP_VARIANT);
+export const syncOmpSkills = (ctx: AdapterSkillContext, desiredSkills: string[]) =>
+  syncPiSkills(ctx, desiredSkills, OMP_VARIANT);
+export const listOmpModels = () => listPiModels(OMP_VARIANT);

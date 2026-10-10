@@ -65,7 +65,7 @@ WORKDIR /app
 # dependency, and rustup does not — without it every build script dies on
 # "linker `cc` not found".
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends gcc libc6-dev pkg-config \
+  && apt-get install -y --no-install-recommends gcc libc6-dev pkg-config nano vi locate \
   && rm -rf /var/lib/apt/lists/*
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -180,6 +180,15 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && rm -rf /var/lib/apt/lists/* \
   && mkdir -p /paperclip \
   && chown node:node /paperclip
+
+# The omp_local adapter spawns the Oh My Pi CLI (`omp`), which runs on Bun,
+# not Node. Install Bun from npm, then omp into /usr/local so the bin lands on
+# PATH (/usr/local/bin/omp) for the node user. Same epoch cadence as above.
+RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
+  && npm install --global --omit=dev bun@latest \
+  && BUN_INSTALL=/usr/local bun add --global @oh-my-pi/pi-coding-agent@latest \
+  && rm -rf /root/.bun/install/cache \
+  && omp --version
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
