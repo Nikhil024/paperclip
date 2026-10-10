@@ -18,7 +18,7 @@ export const EFFORT_LABELS: Record<string, string> = {
 };
 
 const MODEL_ADAPTERS = new Set([
-  "claude_local", "codex_local", "opencode_local", "pi_local", "kimi_local",
+  "claude_local", "codex_local", "opencode_local", "pi_local", "omp_local", "kimi_local",
   "gemini_local", "cursor", "cursor_cloud", "grok_local", "hermes_local", "paperclip_runner",
 ]);
 
@@ -72,7 +72,7 @@ export function composerEfforts(agent: Agent | undefined, model: string, catalog
   if (!catalogIds.includes(effectiveModel)) return [];
   if (agent.adapterType === "claude_local") return claudeLocalReasoningEffortsForModel(effectiveModel);
   if (agent.adapterType === "grok_local") return grokLocalReasoningEffortsForModel(effectiveModel);
-  if (agent.adapterType === "pi_local") return ["off", "minimal", "low", "medium", "high", "xhigh"];
+  if (agent.adapterType === "pi_local" || agent.adapterType === "omp_local") return ["off", "minimal", "low", "medium", "high", "xhigh"];
   if (agent.adapterType === "kimi_local" && typeof agent.adapterConfig.engine === "string"
     && agent.adapterConfig.engine.trim().toLowerCase() === "cli" && modelSupportsEffort(effectiveModel)) return KIMI_SUPPORTED_EFFORTS;
   return [];
@@ -98,7 +98,7 @@ function composerEffortKey(adapterType: string | undefined): string | null {
   if (adapterType === "codex_local" || adapterType === "paperclip_runner") return "modelReasoningEffort";
   if (adapterType === "claude_local" || adapterType === "kimi_local") return "effort";
   if (adapterType === "grok_local") return "reasoningEffort";
-  if (adapterType === "pi_local") return "thinking";
+  if (adapterType === "pi_local" || adapterType === "omp_local") return "thinking";
   if (adapterType === "opencode_local") return "variant";
   return null;
 }
