@@ -3,7 +3,7 @@ FROM node:24-trixie-slim AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 tini \
+  && apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 docker.io tini \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable
 
@@ -189,6 +189,21 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && BUN_INSTALL=/usr/local bun add --global @oh-my-pi/pi-coding-agent@latest \
   && rm -rf /root/.bun/install/cache \
   && omp --version
+
+# GitHub spec-kit (`specify`) so an agent can bootstrap spec-driven
+# development in a workspace. It is a Python tool installed via uv. Tools and
+# their venvs live under /usr/local (not /root, which the node user cannot
+# read) and reuse the system python3 so no managed interpreter is downloaded.
+# Same epoch cadence as above: spec-kit is installed from git HEAD.
+ENV UV_TOOL_DIR=/usr/local/share/uv/tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_PYTHON_PREFERENCE=only-system
+RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
+  && curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh \
+  && uv tool install specify-cli --from git+https://github.com/github/spec-kit.git \
+  && rm -rf /root/.cache/uv \
+  && chmod -R a+rX /usr/local/share/uv \
+  && gosu node specify --help >/dev/null
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
