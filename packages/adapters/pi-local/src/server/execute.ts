@@ -59,7 +59,7 @@ import { isPiUnknownSessionError, parsePiJsonl, createPiJsonlParser } from "./pa
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { resolvePiSkillsHome } from "./skills.js";
-import { buildPiRunArgs, PI_VARIANT, type PiVariant } from "./variant.js";
+import { buildPiRunArgs, PI_VARIANT, resolveOmpSessionFile, type PiVariant } from "./variant.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -569,7 +569,7 @@ export async function execute(
           graceSec: 5,
           onLog,
         });
-      } else {
+      } else if (variant.freshSession === "session-path") {
         try {
           await fs.writeFile(sessionPath, "", { flag: "wx" });
         } catch (err) {
@@ -643,13 +643,14 @@ export async function execute(
       return notes;
     })();
 
-    const buildArgs = (sessionFile: string, userPrompt: string): string[] =>
+    const buildArgs = (sessionFile: string, resumeSession: boolean, userPrompt: string): string[] =>
       buildPiRunArgs(variant, {
         systemPrompt: renderedSystemPromptExtension,
         provider,
         modelId,
         thinking,
         sessionFile,
+        resumeSession,
         // omp_local is not enabled for remote targets, so remoteSkillsDir is Pi-only.
         skillsDir: remoteSkillsDir ?? localSkillsHome,
         extraArgs,
@@ -693,7 +694,7 @@ export async function execute(
         sessionHandoffChars: sessionHandoffNote.length,
         heartbeatPromptChars: attemptRenderedHeartbeatPrompt.length,
       };
-      const args = buildArgs(sessionFile, userPrompt);
+      const args = buildArgs(sessionFile, attemptResumedSession, userPrompt);
       if (onMeta) {
         await onMeta({
           adapterType: variant.type,
@@ -765,7 +766,13 @@ export async function execute(
         parsed.usage = retained.usage;
         parsed.sawAgentEnd = retained.sawAgentEnd;
       }
-      return { proc, rawStderr: proc.stderr, parsed };
+      // omp names a fresh session file itself; the path we asked for only
+      // supplied the directory. Null when omp never opened a session.
+      const resolvedSessionFile =
+        variant.freshSession === "session-dir" && !attemptResumedSession
+          ? resolveOmpSessionFile(proc.stdout, path.dirname(sessionFile))
+          : sessionFile;
+      return { proc, rawStderr: proc.stderr, parsed, sessionFile: resolvedSessionFile };
     };
 
     const toResult = (
@@ -773,6 +780,7 @@ export async function execute(
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
         parsed: ReturnType<typeof parsePiJsonl>;
+        sessionFile: string | null;
       },
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {
@@ -788,7 +796,7 @@ export async function execute(
         };
       }
 
-      const resolvedSessionId = clearSessionOnMissingSession ? null : sessionPath;
+      const resolvedSessionId = clearSessionOnMissingSession ? null : attempt.sessionFile;
       const resolvedSessionParams = resolvedSessionId
         ? {
             sessionId: resolvedSessionId,
@@ -868,7 +876,7 @@ export async function execute(
             graceSec: 5,
             onLog,
           });
-        } else {
+        } else if (variant.freshSession === "session-path") {
           try {
             await fs.writeFile(newSessionPath, "", { flag: "wx" });
           } catch (err) {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import path from "node:path";
 import { resolvePiSkillsHome } from "./skills.js";
-import { buildPiRunArgs, OMP_VARIANT, PI_VARIANT } from "./variant.js";
+import { buildPiRunArgs, OMP_VARIANT, PI_VARIANT, resolveOmpSessionFile } from "./variant.js";
 
 const input = {
   systemPrompt: "SYS",
@@ -9,6 +9,7 @@ const input = {
   modelId: "org/qwen",
   thinking: "high",
   sessionFile: "/home/u/.x/paperclips/s.jsonl",
+  resumeSession: true,
   skillsDir: "/home/u/.x/agent/skills",
   extraArgs: ["--verbose"],
   userPrompt: "do it",
@@ -46,11 +47,43 @@ describe("buildPiRunArgs", () => {
     expect(args.at(-1)).toBe("do it");
   });
 
+  it("Pi always passes --session, even for a fresh session (open-or-create)", () => {
+    const args = buildPiRunArgs(PI_VARIANT, { ...input, resumeSession: false });
+    expect(args).toContain("--session");
+    expect(args).not.toContain("--session-dir");
+  });
+
+  it("omp starts a fresh session with --session-dir, since --session only resumes", () => {
+    const args = buildPiRunArgs(OMP_VARIANT, { ...input, resumeSession: false });
+    expect(args).not.toContain("--session");
+    expect(args.slice(args.indexOf("--session-dir"), args.indexOf("--session-dir") + 2)).toEqual([
+      "--session-dir", "/home/u/.x/paperclips",
+    ]);
+  });
+
   it("omits optional flags when unset", () => {
     const args = buildPiRunArgs(OMP_VARIANT, { ...input, provider: null, modelId: null, thinking: "", extraArgs: [] });
     expect(args).not.toContain("--provider");
     expect(args).not.toContain("--model");
     expect(args).not.toContain("--thinking");
+  });
+});
+
+describe("resolveOmpSessionFile", () => {
+  // Real first stdout line and resulting file name from omp 18.9.1.
+  const stdout =
+    '{"type":"session","version":3,"id":"01a13c0b-efd3-74d1-87eb-79791c794d15","timestamp":"2026-10-14T20:12:57.683Z","cwd":"/app"}\n' +
+    '{"type":"agent_start"}\n';
+
+  it("derives omp's <timestamp>_<id>.jsonl inside the session dir", () => {
+    expect(resolveOmpSessionFile(stdout, "/tmp/s")).toBe(
+      path.join("/tmp/s", "2026-10-14T20-12-57-683Z_01a13c0b-efd3-74d1-87eb-79791c794d15.jsonl"),
+    );
+  });
+
+  it("returns null when omp never opened a session", () => {
+    expect(resolveOmpSessionFile("Error: Session not found.\n", "/tmp/s")).toBeNull();
+    expect(resolveOmpSessionFile("", "/tmp/s")).toBeNull();
   });
 });
 
