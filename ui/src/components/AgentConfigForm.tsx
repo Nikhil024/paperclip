@@ -6,7 +6,7 @@ import { aiRoutingHarness } from "@paperclipai/shared";
 import { AiConnectionField } from "./ai-connections/AiConnectionField";
 import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema } from "@paperclipai/shared";
 import { testAgentSetup } from "@/lib/test-agent-setup";
-import { setupEfforts } from "../lib/agent-setup-fields";
+import { isPiFamilyAdapter, setupEfforts } from "../lib/agent-setup-fields";
 import { RuntimeTestCard } from "./RuntimeTestCard";
 import { useState, useEffect, useRef, useMemo, useCallback, Children, isValidElement, type ReactNode } from "react";
 import type { AdapterConfigSection } from "../adapters/types";
@@ -1306,7 +1306,7 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         : adapterType === "opencode_local"
           ? "variant"
           : adapterType === "grok_local" ? "reasoningEffort"
-          : adapterType === "pi_local" ? "thinking" : "effort";
+          : isPiFamilyAdapter(adapterType) ? "thinking" : "effort";
   const thinkingEffortOptions =
     isCodexHarness
       ? codexReasoningEffortOptions(currentModelId, "Auto").map((option) => ({
@@ -1319,8 +1319,8 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
           ? openCodeThinkingEffortOptions
           : adapterType === "kimi_local"
             ? kimiThinkingEffortOptions
-            : adapterType === "pi_local"
-              ? [{ id: "", label: "Auto" }, ...["off", "minimal", "low", "medium", "high", "xhigh"].map(id => ({ id, label: id }))]
+            : isPiFamilyAdapter(adapterType)
+              ? [{ id: "", label: "Auto" }, ...setupEfforts(adapterType).map(id => ({ id, label: id }))]
               : adapterType === "claude_local" || adapterType === "grok_local"
                 ? [{ id: "", label: "Auto" }, ...setupEfforts(adapterType, currentModelId).map((id) => ({
                     id,
@@ -1792,9 +1792,9 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 open={modelOpen}
                 onOpenChange={setModelOpen}
                 defaultLabel={adapterType === "claude_local" ? `Default (${DEFAULT_CLAUDE_LOCAL_MODEL})` : undefined}
-                allowDefault={adapterType !== "opencode_local" && adapterType !== "pi_local" && adapterType !== "paperclip_runner"}
-                required={adapterType === "opencode_local" || adapterType === "pi_local"}
-                groupByProvider={!connectionModels && (adapterType === "opencode_local" || adapterType === "pi_local")}
+                allowDefault={adapterType !== "opencode_local" && !isPiFamilyAdapter(adapterType) && adapterType !== "paperclip_runner"}
+                required={adapterType === "opencode_local" || isPiFamilyAdapter(adapterType)}
+                groupByProvider={!connectionModels && (adapterType === "opencode_local" || isPiFamilyAdapter(adapterType))}
                 preserveOrder={Boolean(connectionModels) || adapterCuratesModelOrder(adapterType)}
                 creatable
                 detectedModel={connectionModels ? undefined : detectedModel}
@@ -3920,6 +3920,13 @@ export function ModelDropdown({
               placeholder={creatable ? "Search models... (type to create)" : "Search models..."}
               value={modelSearch}
               onChange={(e) => setModelSearch(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter" || !canCreateManualModel) return;
+                e.preventDefault();
+                onChange(manualModel);
+                onOpenChange(false);
+                setModelSearch("");
+              }}
               autoFocus
             />
             {modelSearch && (

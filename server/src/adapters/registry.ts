@@ -128,8 +128,16 @@ import {
   testEnvironment as piTestEnvironment,
   sessionCodec as piSessionCodec,
   listPiModels,
+  ompExecute,
+  ompTestEnvironment,
+  listOmpSkills,
+  syncOmpSkills,
+  listOmpModels,
 } from "@paperclipai/adapter-pi-local/server";
-import { agentConfigurationDoc as piAgentConfigurationDoc } from "@paperclipai/adapter-pi-local";
+import {
+  agentConfigurationDoc as piAgentConfigurationDoc,
+  ompAgentConfigurationDoc,
+} from "@paperclipai/adapter-pi-local";
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
@@ -885,6 +893,26 @@ const piLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: piAgentConfigurationDoc,
 };
 
+// Oh My Pi reuses the Pi adapter package. Local-only: no sandbox runtime install
+// spec, and it is not in the shared remote-managed adapter list.
+const ompLocalAdapter: ServerAdapterModule = {
+  type: "omp_local",
+  runtimeToolDelivery: "environment",
+  execute: ompExecute,
+  testEnvironment: ompTestEnvironment,
+  listSkills: listOmpSkills,
+  syncSkills: syncOmpSkills,
+  sessionCodec: piSessionCodec,
+  sessionManagement: getAdapterSessionManagement("omp_local") ?? undefined,
+  models: [],
+  listModels: listOmpModels,
+  supportsLocalAgentJwt: true,
+  supportsInstructionsBundle: true,
+  instructionsPathKey: "instructionsFilePath",
+  requiresMaterializedRuntimeSkills: true,
+  agentConfigurationDoc: ompAgentConfigurationDoc,
+};
+
 const adaptersByType = new Map<string, ServerAdapterModule>();
 
 // For builtin types that are overridden by an external adapter, we keep the
@@ -904,6 +932,7 @@ function registerBuiltInAdapters() {
     paperclipRunnerAdapter,
     openCodeLocalAdapter,
     piLocalAdapter,
+    ompLocalAdapter,
     cursorCloudAdapter,
     cursorLocalAdapter,
     geminiLocalAdapter,

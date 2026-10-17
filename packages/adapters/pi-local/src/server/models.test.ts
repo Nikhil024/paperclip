@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   ensurePiModelConfiguredAndAvailable,
   listPiModels,
+  parseOmpModelsJson,
   resetPiModelsCacheForTests,
 } from "./models.js";
+import { OMP_VARIANT } from "./variant.js";
 
 describe("pi models", () => {
   afterEach(() => {
@@ -62,5 +64,31 @@ describe("pi models", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it("names the omp variant in errors", async () => {
+    await expect(
+      ensurePiModelConfiguredAndAvailable({ model: "", variant: OMP_VARIANT }),
+    ).rejects.toThrow("Oh My Pi requires `adapterConfig.model`");
+  });
+});
+
+describe("parseOmpModelsJson", () => {
+  it("reads selectors from `omp models --json`", () => {
+    const stdout = JSON.stringify({
+      models: [
+        { provider: "spark", id: "qwen3.8-flash-next", selector: "spark/qwen3.8-flash-next" },
+        { provider: "openrouter", id: "org/model" },
+        { provider: "broken" },
+      ],
+    });
+    expect(parseOmpModelsJson(stdout)).toEqual([
+      { id: "spark/qwen3.8-flash-next", label: "spark/qwen3.8-flash-next" },
+      { id: "openrouter/org/model", label: "openrouter/org/model" },
+    ]);
+  });
+
+  it("returns [] for non-JSON output", () => {
+    expect(parseOmpModelsJson("provider  model")).toEqual([]);
   });
 });

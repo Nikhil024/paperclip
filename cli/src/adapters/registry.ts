@@ -34,6 +34,11 @@ const piLocalCLIAdapter: CLIAdapterModule = {
   formatStdoutEvent: printPiStreamEvent,
 };
 
+const ompLocalCLIAdapter: CLIAdapterModule = {
+  type: "omp_local",
+  formatStdoutEvent: printPiStreamEvent,
+};
+
 const cursorLocalCLIAdapter: CLIAdapterModule = {
   type: "cursor",
   formatStdoutEvent: printCursorStreamEvent,
@@ -80,6 +85,7 @@ const adaptersByType = new Map<string, CLIAdapterModule>(
     codexLocalCLIAdapter,
     openCodeLocalCLIAdapter,
     piLocalCLIAdapter,
+    ompLocalCLIAdapter,
     cursorLocalCLIAdapter,
     cursorCloudCLIAdapter,
     geminiLocalCLIAdapter,
