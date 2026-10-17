@@ -56,6 +56,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
 import { isPiUnknownSessionError, parsePiJsonl, createPiJsonlParser } from "./parse.js";
+import { createPiStdoutCompactor, resolvePiStdoutLogMode } from "./stdout-compaction.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { resolvePiSkillsHome } from "./skills.js";
@@ -241,6 +242,7 @@ export async function execute(
   const hostSkillsDir = resolvePiSkillsHome(config, variant);
   const model = asString(config.model, "").trim();
   const thinking = asString(config.thinking, "").trim();
+  const stdoutLogMode = resolvePiStdoutLogMode(config);
 
   // Parse model into provider and model id
   const provider = parseModelProvider(model);
@@ -629,6 +631,9 @@ export async function execute(
 
     const commandNotes = (() => {
       const notes = [...preparedRuntimeConfig.notes];
+      if (stdoutLogMode !== "raw") {
+        notes.push(`Pi stdout run-log compaction mode: ${stdoutLogMode}`);
+      }
       if (!resolvedInstructionsFilePath) return notes;
       if (instructionsReadFailed) {
         notes.push(
@@ -711,6 +716,14 @@ export async function execute(
 
       // Buffer stdout by lines to handle partial JSON chunks
       let stdoutBuffer = "";
+      const compactStdoutLine = createPiStdoutCompactor(stdoutLogMode);
+      // Compaction only affects the persisted run log; parsePiJsonl reads the unfiltered proc.stdout.
+      const emitCompacted = async (line: string, suffix: string) => {
+        const compacted = compactStdoutLine(line);
+        if (compacted !== null) {
+          await onLog("stdout", compacted + suffix);
+        }
+      };
       const bufferedOnLog = async (stream: "stdout" | "stderr", chunk: string) => {
         if (stream === "stderr") {
           // Pass stderr through immediately (not JSONL)
@@ -718,16 +731,14 @@ export async function execute(
           return;
         }
 
-        // Buffer stdout and emit only complete lines
         stdoutBuffer += chunk;
         const lines = stdoutBuffer.split("\n");
         // Keep the last (potentially incomplete) line in the buffer
         stdoutBuffer = lines.pop() || "";
 
-        // Emit complete lines
         for (const line of lines) {
           if (line) {
-            await onLog(stream, line + "\n");
+            await emitCompacted(line, "\n");
           }
         }
       };
@@ -755,7 +766,7 @@ export async function execute(
 
       // Flush any remaining buffer content
       if (stdoutBuffer) {
-        await onLog("stdout", stdoutBuffer);
+        await emitCompacted(stdoutBuffer, "");
       }
 
       // Display output is capped by the process transport. Keep accounting
