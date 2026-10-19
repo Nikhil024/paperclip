@@ -1,3 +1,6 @@
+import { isOpenRouterUrl, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
+import { prepareAcpxCodexObservabilityHome } from "../codex-observability-home.js";
+import { AGENT_OBSERVABILITY_ENV_KEYS, applyObservabilityEnvironment } from "../agent-observability.js";
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
 import { withAdapterExecutionPhase, type AdapterExecutionPhase } from "../execution-phase.js";
 import fs from "node:fs/promises";
@@ -231,6 +234,7 @@ type AcpxRuntimeFactory = (options: PaperclipAcpRuntimeOptions) => AcpRuntime;
  * in-sandbox staged workspace + home, which this cache reuses.
  */
 export interface StagedRuntimeCacheEntry {
+  observabilityCompatibilityKey?: string;
   stagedRuntime: PreparedAdapterExecutionTargetRuntime;
   /**
    * The env keys the per-adapter managed-home seam mutated when it staged (e.g.
@@ -615,6 +619,7 @@ const ACPX_INHERITED_PROVIDER_ENV_KEYS: Readonly<Record<string, ReadonlySet<stri
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_CUSTOM_HEADERS",
     "ANTHROPIC_MODEL",
     "ANTHROPIC_SMALL_FAST_MODEL",
     "CLAUDE_CONFIG_DIR",
@@ -1313,6 +1318,7 @@ async function prepareCodexSkillRuntime(input: {
   env: Record<string, string>;
   moduleDir: string;
   onLog: AdapterExecutionContext["onLog"];
+  observability?: AdapterExecutionContext["observability"];
   // Step-timing seam: threaded from `buildRuntime` so the nested
   // `skills.reconcile` boundary (step 3) can emit its own `run.startup.step`
   // event at its call-site. Both optional — a caller without an event sink or
@@ -1351,6 +1357,17 @@ async function prepareCodexSkillRuntime(input: {
       apiKey,
       onLog: input.onLog,
     });
+  let launchCodexHome = effectiveCodexHome;
+  if (input.observability?.otelConfig) {
+    // Managed AI connections project a server-owned credential home into env.
+    // Only a caller override lacks this server-supplied connection attribution.
+    if (configuredCodexHome && !input.config.managedAiConnection) await input.onLog("stderr", "[paperclip] Company observability is unavailable for a caller-owned Codex home.\n");
+    else {
+      try {
+        launchCodexHome = await prepareAcpxCodexObservabilityHome(effectiveCodexHome, input.observability, input.agentId);
+      } catch { await input.onLog("stderr", "[paperclip] Company observability configuration could not be prepared; execution continues without company export.\n"); }
+    }
+  }
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "codex" });
   const skillsHome = path.join(effectiveCodexHome, "skills");
@@ -1394,7 +1411,7 @@ async function prepareCodexSkillRuntime(input: {
   }
   await writeManagedCodexSkillsManifest(skillsHome, selectedSkills.map((entry) => entry.runtimeName));
 
-  input.env.CODEX_HOME = effectiveCodexHome;
+  input.env.CODEX_HOME = launchCodexHome;
 
   return {
     identity: {
@@ -2071,7 +2088,14 @@ async function buildRuntime(input: {
     // are absent from tempKeysApplied and keep their compatibility protection.
     if (!scratchKeys.has(key) || value !== scratch.dir) resolvedAdapterEnv[key] = value;
   }
+  if (acpxAgent === "claude" && isOpenRouterUrl(env.ANTHROPIC_BASE_URL ?? process.env.ANTHROPIC_BASE_URL)) {
+    env.ANTHROPIC_CUSTOM_HEADERS = openRouterClaudeHeaders(env.ANTHROPIC_CUSTOM_HEADERS ?? process.env.ANTHROPIC_CUSTOM_HEADERS);
+    resolvedAdapterEnv.ANTHROPIC_CUSTOM_HEADERS = env.ANTHROPIC_CUSTOM_HEADERS;
+  }
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
+  if (input.ctx.observability) {
+    applyObservabilityEnvironment(env, input.ctx.observability);
+  }
   // For the claude agent, set model via ANTHROPIC_MODEL at startup rather than
   // via session/set_config_option — the ACP server's set_config_option handler
   // validates the value against its internal available-models list and rejects
@@ -2100,7 +2124,7 @@ async function buildRuntime(input: {
         "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
         // Preserve Codex's default secret-name exclusions. The short-lived
         // Paperclip API token is required by the agent skill's Bash/curl calls.
-        ...Object.keys(env).filter(key => key === "PAPERCLIP_API_KEY" || !/key|secret|token/i.test(key)),
+        ...Object.keys(env).filter(key => !(AGENT_OBSERVABILITY_ENV_KEYS as readonly string[]).includes(key) && (key === "PAPERCLIP_API_KEY" || !/key|secret|token/i.test(key))),
       ])] } : {}),
       requestedModel,
       requestedThinkingEffort,
@@ -2161,6 +2185,7 @@ async function buildRuntime(input: {
         agentId: agent.id,
         config,
         env,
+        observability: input.ctx.observability,
         moduleDir: input.engine.moduleDir,
         onLog: input.ctx.onLog,
         onEvent: input.ctx.onEvent,
@@ -2385,6 +2410,7 @@ async function buildRuntime(input: {
       target: remoteTarget,
       env,
       isCompatibleResume,
+      observabilityCompatibilityKey: input.ctx.observability?.compatibilityKey,
       stage: (assets) =>
         stageAcpRemoteRuntime({
           runId,
@@ -3664,10 +3690,12 @@ function saveStagedRuntimeAfterCleanTurn(input: {
   handles: Map<string, StagedRuntimeCacheEntry>;
   prepared: AcpxPreparedRuntime;
   now: number;
+  observabilityCompatibilityKey?: string;
 }) {
   const { prepared } = input;
   if (!prepared.stagedRuntime || prepared.remoteStagingEnvDelta === null) return;
   input.handles.set(prepared.sessionKey, {
+    observabilityCompatibilityKey: input.observabilityCompatibilityKey,
     stagedRuntime: prepared.stagedRuntime,
     envDelta: prepared.remoteStagingEnvDelta,
     teardown: prepared.remoteManagedHomeTeardown,
@@ -4127,13 +4155,29 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
     // turn: the closed ACP kind of the silent tool call and how long it went
     // without an update. The watchdog cancels the turn and arms the same
     // fail-fast deadline as a duplex loss.
-    let stalledTool: { kind: string; silentMs: number } | null = null;
+    // `permissionRequested` says whether the agent's permission request for
+    // that call reached the host. It records receipt only, not that the reply
+    // reached the agent, so it separates a call stalled before its request
+    // arrived from one stalled on the return trip or after the decision;
+    // `pendingPermissionRequested` counts the pending calls whose request did.
+    let stalledTool: {
+      kind: string;
+      silentMs: number;
+      permissionRequested: boolean;
+      pendingPermissionRequested: number;
+      settledSameKind: number;
+      settledSameKindPermissionRequested: number;
+    } | null = null;
     let stalledToolTimer: ReturnType<typeof setInterval> | undefined;
     let forcedStop = false;
     let runtimeStopConfirmed = false;
     let safeInterruptedSession = false;
     let preserveInterruptedSession = false;
     const interruptionTools = new Map<string, { kind?: string; status?: string; firstSeenAt?: number; lastUpdateAt?: number }>();
+    // Tool call ids whose permission request reached the host. The request can
+    // arrive before the relay sees the call's `tool_call` event, so it is kept
+    // apart from `interruptionTools`.
+    const permissionRequestedToolCallIds = new Set<string>();
     let incompleteToolInventory = false;
     try {
       await ctx.onCancellationReady?.();
@@ -4381,7 +4425,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // the reused runtime cannot expire under its own timer while this run uses
         // it (today's `clearWarmHandleTimer(cached)` after the reuse decision).
         let cached = canResume ? hostStore.borrow(prepared.sessionKey) : undefined;
-        if (cached && (ctx.context.refreshTools === true
+        if (cached && (cached.observabilityCompatibilityKey !== ctx.observability?.compatibilityKey || ctx.context.refreshTools === true
           || asString(previousParams.mcpFingerprint, "") !== shortHash(prepared.mcpIdentity)
           // MCP bearer credentials are run-scoped, even for an unchanged catalog.
           || prepared.mcpServers.length > 0)) {
@@ -4425,6 +4469,13 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // must not merge the Paperclip server's ambient environment back in
           // when it spawns the provider child.
           inheritProcessEnv: false,
+          // Observe permission requests without deciding them: returning
+          // undefined leaves the decision to ACPX's permission-mode resolver.
+          onPermissionRequest: async (request) => {
+            const toolCallId = request.raw?.toolCall?.toolCallId;
+            if (typeof toolCallId === "string" && toolCallId) permissionRequestedToolCallIds.add(toolCallId);
+            return undefined;
+          },
           onAgentStderr: prepared.childStderrLogPath
             ? (chunk) => routeChildStderr(childStderrState, chunk)
             : undefined,
@@ -5021,26 +5072,40 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             if (stalledTool !== null || turnStopRequestedAt !== null) return;
             const checkedAt = now();
             if (lastToolSettledAt !== null && checkedAt - lastToolSettledAt < stalledToolTimeoutMs) return;
-            let oldest: { kind?: string; silentMs: number } | null = null;
-            for (const tool of interruptionTools.values()) {
-              if (!isPendingAcpTool(tool) || tool.lastUpdateAt === undefined) continue;
+            let oldest: { toolCallId: string; kind?: string; silentMs: number } | null = null;
+            let pendingPermissionRequested = 0;
+            for (const [toolCallId, tool] of interruptionTools) {
+              if (!isPendingAcpTool(tool)) continue;
+              if (permissionRequestedToolCallIds.has(toolCallId)) pendingPermissionRequested += 1;
+              if (tool.lastUpdateAt === undefined) continue;
               const silentMs = checkedAt - tool.lastUpdateAt;
               if (silentMs >= stalledToolTimeoutMs && (!oldest || silentMs > oldest.silentMs)) {
-                oldest = { kind: tool.kind, silentMs };
+                oldest = { toolCallId, kind: tool.kind, silentMs };
               }
             }
             if (!oldest) return;
             clearInterval(stalledToolTimer);
+            let settledSameKind = 0;
+            let settledSameKindPermissionRequested = 0;
+            for (const [toolCallId, tool] of interruptionTools) {
+              if (isPendingAcpTool(tool) || tool.kind !== oldest.kind) continue;
+              settledSameKind += 1;
+              if (permissionRequestedToolCallIds.has(toolCallId)) settledSameKindPermissionRequested += 1;
+            }
             const knownKinds: readonly string[] = ACP_TOOL_KINDS;
             stalledTool = {
               kind: oldest.kind && knownKinds.includes(oldest.kind) ? oldest.kind : "unknown",
               silentMs: oldest.silentMs,
+              permissionRequested: permissionRequestedToolCallIds.has(oldest.toolCallId),
+              pendingPermissionRequested,
+              settledSameKind,
+              settledSameKindPermissionRequested,
             };
             turnStopRequestedAt = checkedAt;
             pendingToolsAtStop = [...interruptionTools.values()].filter(isPendingAcpTool);
             void ctx.onLog(
               "stderr",
-              `[paperclip] A pending tool call (kind ${stalledTool.kind}) had no update for ${Math.round(stalledTool.silentMs / 1000)}s; ending the turn.\n`,
+              `[paperclip] A pending tool call (kind ${stalledTool.kind}) had no update for ${Math.round(stalledTool.silentMs / 1000)}s; ending the turn. Its permission request ${stalledTool.permissionRequested ? "reached" : "did not reach"} Paperclip.\n`,
             ).catch(() => {});
             void turn.cancel({ reason: "paperclip stalled tool watchdog" }).catch(() => {});
             armCancelDeadline();
@@ -5321,7 +5386,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             status: channelLost || toolStalled ? "failed" : terminal.status,
             ...activityDiagnostics,
             ...(toolStalled && stalledTool
-              ? { acpStalledToolKind: stalledTool.kind, acpStalledToolSilentMs: stalledTool.silentMs }
+              ? {
+                  acpStalledToolKind: stalledTool.kind,
+                  acpStalledToolSilentMs: stalledTool.silentMs,
+                  acpStalledToolPermissionRequested: stalledTool.permissionRequested,
+                  acpPendingToolPermissionRequestedCount: stalledTool.pendingPermissionRequested,
+                  acpSettledSameKindToolCount: stalledTool.settledSameKind,
+                  acpSettledSameKindToolPermissionRequestedCount: stalledTool.settledSameKindPermissionRequested,
+                }
               : {}),
             ...(failureDiagnostic ? { terminalSessionFailure: failureDiagnostic } : {}),
             ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
@@ -5638,7 +5710,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         settleReuse: (slots, decision) => timedPhase("settle_reuse", async () => {
           if (!slots.has("staged_runtime")) return;
           if (decision.kind === "save" && decision.savedId === "staged_runtime") {
-            saveStagedRuntimeAfterCleanTurn({ handles: stagedRuntimes, prepared, now: now() });
+            saveStagedRuntimeAfterCleanTurn({ handles: stagedRuntimes, prepared, now: now(), observabilityCompatibilityKey: ctx.observability?.compatibilityKey });
             return;
           }
           await discardStagedRuntime({ handles: stagedRuntimes, prepared });

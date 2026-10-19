@@ -61,6 +61,7 @@ import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
 import { resolvePiSkillsHome } from "./skills.js";
 import { buildPiRunArgs, PI_VARIANT, resolveOmpSessionFile, type PiVariant } from "./variant.js";
+import { preparePiOpenRouterExtension } from "./openrouter-extension.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -344,7 +345,10 @@ export async function execute(
     variant.type === "omp_local" && localAgentConfigDir
       ? path.join(localAgentConfigDir, "skills")
       : hostSkillsDir;
+  let attributionExtension: Awaited<ReturnType<typeof preparePiOpenRouterExtension>> | undefined;
   try {
+    attributionExtension = await preparePiOpenRouterExtension();
+    let attributionExtensionPath = attributionExtension.extensionPath;
     if (!executionTargetIsRemote) {
       await ensurePiSkillsInjected(localSkillsHome, onLog, piSkillEntries, desiredPiSkillNames);
     }
@@ -443,6 +447,10 @@ export async function execute(
           onRuntimeProgress: ctx.onRuntimeProgress,
           assets: [
             {
+              key: "attribution",
+              localDir: attributionExtension.directory,
+            },
+            {
               key: "skills",
               localDir: localSkillsDir,
               followSymlinks: true,
@@ -476,6 +484,9 @@ export async function execute(
         }
         remoteRuntimeRootDir = preparedRemoteRuntime.runtimeRootDir;
         remoteSkillsDir = preparedRemoteRuntime.assetDirs.skills ?? null;
+        const remoteAttributionDir = preparedRemoteRuntime.assetDirs.attribution;
+        if (!remoteAttributionDir) throw new Error("Pi attribution extension was not staged to the execution target.");
+        attributionExtensionPath = path.posix.join(remoteAttributionDir, "openrouter-attribution.mjs");
         if (localAgentConfigDir && preparedRemoteRuntime.assetDirs.agentConfig) {
           env.PI_CODING_AGENT_DIR = preparedRemoteRuntime.assetDirs.agentConfig;
         }
@@ -658,7 +669,9 @@ export async function execute(
         resumeSession,
         // omp_local is not enabled for remote targets, so remoteSkillsDir is Pi-only.
         skillsDir: remoteSkillsDir ?? localSkillsHome,
-        extraArgs,
+        // Both pi and omp accept --extension; the OpenRouter attribution
+        // extension rides along after the configured extra args.
+        extraArgs: [...extraArgs, "--extension", attributionExtensionPath],
         userPrompt,
       });
 
@@ -913,6 +926,6 @@ export async function execute(
       }
     }
   } finally {
-    await preparedRuntimeConfig.cleanup();
+    await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup()]);
   }
 }
