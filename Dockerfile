@@ -190,7 +190,11 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 # PATH (/usr/local/bin/omp) for the node user. Same epoch cadence as above.
 RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && npm install --global --omit=dev bun@latest \
-  && BUN_INSTALL=/usr/local bun add --global @oh-my-pi/pi-coding-agent@latest \
+  # Pinned: omp >= v18.6.3 treats `--session <path>` as resume-only and rejects
+  # the empty session file the Pi adapter pre-creates ("the session file holds
+  # no entries"), so every omp_local heartbeat fails. v18.6.1 is the last
+  # release that creates the session at the given path.
+  && BUN_INSTALL=/usr/local bun add --global @oh-my-pi/pi-coding-agent@18.6.1 \
   && rm -rf /root/.bun/install/cache \
   && omp --version
 
