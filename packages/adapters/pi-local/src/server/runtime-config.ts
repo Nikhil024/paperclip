@@ -107,16 +107,37 @@ function parseProviderConfig(
 // and repoints PI_CODING_AGENT_DIR at the in-sandbox copy.
 export async function preparePiRuntimeConfig(input: {
   env: Record<string, string>;
+  /** "models.json" for Pi; omp reads "models.yml" (JSON is valid YAML). */
+  modelsFileName?: string;
 }): Promise<PreparedPiRuntimeConfig> {
-  const resolveEnv = (name: string): string | undefined => input.env[name] ?? process.env[name];
-  const { providers, warning } = parseProviderConfig(
-    input.env.PAPERCLIP_PI_PROVIDERS ?? process.env.PAPERCLIP_PI_PROVIDERS,
+  const modelsFileName = input.modelsFileName ?? "models.json";
+  // Agent-config JSON may only expand placeholders from the run env (agent config
+  // env + Paperclip run vars; it never contains the server's process.env), so an
+  // agent editor cannot exfiltrate server secrets via {env:DATABASE_URL}. Only
+  // operator-set process.env JSON may resolve from process.env.
+  const fromAgentConfig = input.env.PAPERCLIP_PI_PROVIDERS !== undefined;
+  const unresolved = new Set<string>();
+  const resolveEnv = (name: string): string | undefined => {
+    const value = fromAgentConfig ? input.env[name] : input.env[name] ?? process.env[name];
+    if (fromAgentConfig && !value) unresolved.add(name);
+    return value;
+  };
+  const parsed = parseProviderConfig(
+    fromAgentConfig ? input.env.PAPERCLIP_PI_PROVIDERS : process.env.PAPERCLIP_PI_PROVIDERS,
     resolveEnv,
   );
+  const { providers } = parsed;
+  const warnings: string[] = [];
+  if (parsed.warning) warnings.push(parsed.warning);
+  if (unresolved.size > 0) {
+    warnings.push(
+      `PAPERCLIP_PI_PROVIDERS: {env:...} placeholder(s) not set in the agent env were left unexpanded: ${[...unresolved].join(", ")}.`,
+    );
+  }
   if (!providers) {
     return {
       env: input.env,
-      notes: warning ? [warning] : [],
+      notes: warnings,
       agentConfigDir: null,
       cleanup: async () => {},
     };
@@ -138,7 +159,7 @@ export async function preparePiRuntimeConfig(input: {
   const agentConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-agent-config-"));
   try {
     await fs.writeFile(
-      path.join(agentConfigDir, "models.json"),
+      path.join(agentConfigDir, modelsFileName),
       `${JSON.stringify({ providers }, null, 2)}\n`,
       "utf8",
     );
@@ -155,8 +176,8 @@ export async function preparePiRuntimeConfig(input: {
       PI_CODING_AGENT_DIR: agentConfigDir,
     },
     notes: [
-      ...(warning ? [warning] : []),
-      `Injected ${Object.keys(providers).length} custom Pi provider(s) from PAPERCLIP_PI_PROVIDERS into a managed models.json: ${Object.keys(providers).join(", ")}.`,
+      ...warnings,
+      `Injected ${Object.keys(providers).length} custom Pi provider(s) from PAPERCLIP_PI_PROVIDERS into a managed ${modelsFileName}: ${Object.keys(providers).join(", ")}.`,
     ],
     agentConfigDir,
     cleanup: async () => {

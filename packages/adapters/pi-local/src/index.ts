@@ -54,3 +54,19 @@ Notes:
 - All tools (read, bash, edit, write, grep, find, ls) are enabled by default.
 - Agent instructions are appended to Pi's system prompt via --append-system-prompt, while the user task is sent via -p.
 `;
+
+export const ompAgentConfigurationDoc = `# omp_local agent configuration
+
+Adapter: omp_local
+
+Runs Oh My Pi (\`omp\`, a Pi fork) locally. It shares the pi_local adapter code and config fields:
+cwd, instructionsFilePath, promptTemplate, model (required, provider/model), thinking, command
+(defaults to "omp"), env, extraArgs, timeoutSec, graceSec.
+
+Notes:
+- Use \`omp models\` to list available models. Custom providers live in ~/.omp/agent/models.yml.
+- PAPERCLIP_PI_PROVIDERS (Pi models.json "providers" shape) is written to a managed models.yml; that
+  managed agent dir replaces ~/.omp/agent for the run, so host omp logins/config are not used then.
+- Sessions are stored in ~/.omp/paperclips/ and resumed with --session <file>.
+- Paperclip skills are linked into the agent dir's skills/ folder (omp has no --skill flag).
+`;
