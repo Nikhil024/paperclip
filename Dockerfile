@@ -202,6 +202,19 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
   && rm -rf /root/.bun/install/cache \
   && omp --version
 
+# REA (Reverse Engineer Anything, github.com/morluto/rea): MCP server + CLI the
+# agents use to take apart binaries, Electron apps, APKs and the like, plus the
+# Ghidra engine it drives for native code. rea needs a procps `ps` on Linux;
+# Ghidra 12.1 needs JDK 21 (12.2 would need JDK 25). Registration is per agent:
+# the Claude adapter runs with --strict-mcp-config, so add the MCP server in
+# the agent's Paperclip settings (command `rea`, args ["mcp"]); for omp/pi run
+# `rea setup --client omp` once inside the container (it writes to the data
+# volume). Import the skill from github.com/morluto/rea under Skills.
+ARG GHIDRA_VERSION=12.1.4
+ARG GHIDRA_ARCHIVE=ghidra_12.1.4_PUBLIC_20260921.zip
+ENV GHIDRA_INSTALL_DIR=/opt/ghidra
+RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}"   && apt-get update   && apt-get install -y --no-install-recommends procps unzip openjdk-21-jdk-headless   && rm -rf /var/lib/apt/lists/*   && npm install --global --omit=dev rea-agents@6.8.0   && curl -fsSL -o /tmp/ghidra.zip "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/${GHIDRA_ARCHIVE}"   && unzip -q /tmp/ghidra.zip -d /opt   && mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra   && rm /tmp/ghidra.zip   && chmod -R a+rX /opt/ghidra   && gosu node rea doctor --provider ghidra --json
+
 # GitHub spec-kit (`specify`) so an agent can bootstrap spec-driven
 # development in a workspace. It is a Python tool installed via uv. Tools and
 # their venvs live under /usr/local (not /root, which the node user cannot
