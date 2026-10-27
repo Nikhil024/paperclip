@@ -22,6 +22,11 @@ export const HERMES_PROVIDER_KEYS: Record<string, string> = {
   minimax: "MINIMAX_API_KEY",
 };
 
+/** pi_local and omp_local (Oh My Pi) share the Pi adapter and its setup fields. */
+export function isPiFamilyAdapter(adapter: string): boolean {
+  return adapter === "pi_local" || adapter === "omp_local";
+}
+
 export function setupProviderKeys(adapter: string) {
   return adapter === "hermes_local" ? HERMES_PROVIDER_KEYS : PROVIDER_ENV_KEYS;
 }
@@ -36,6 +41,8 @@ export function setupEfforts(adapter: string, model = ""): string[] {
         .filter(Boolean);
     case "pi_local":
       return ["off", "minimal", "low", "medium", "high", "xhigh"];
+    case "omp_local":
+      return ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
     case "grok_local":
       return [...grokLocalReasoningEffortsForModel(model)];
     default:

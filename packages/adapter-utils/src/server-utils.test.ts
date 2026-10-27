@@ -16,6 +16,7 @@ import {
   buildRuntimeToolsEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
+  ensurePaperclipSkillSymlink,
   isPaperclipExternalChatContractTurn,
   isPaperclipExternalChatQuestionResponseTurn,
   isPaperclipExternalChatTurn,
@@ -4037,5 +4038,25 @@ describe("wake continuation comment ownership", () => {
       executionContinuation: { ...continuation([]), objective },
     }, { suppressIssueDescription: true });
     expect(legacy).toContain(`"objective":"${objective}"`);
+  });
+});
+
+describe("ensurePaperclipSkillSymlink", () => {
+  it("links a skill directory (a junction on Windows) and skips an up-to-date link", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-skill-link-"));
+    try {
+      const source = path.join(root, "source-skill");
+      await fs.mkdir(source);
+      await fs.writeFile(path.join(source, "SKILL.md"), "# skill\n");
+      const target = path.join(root, "skills", "my-skill");
+      await fs.mkdir(path.dirname(target));
+
+      await expect(ensurePaperclipSkillSymlink(source, target)).resolves.toBe("created");
+      expect((await fs.lstat(target)).isSymbolicLink()).toBe(true);
+      expect(await fs.readFile(path.join(target, "SKILL.md"), "utf8")).toBe("# skill\n");
+      await expect(ensurePaperclipSkillSymlink(source, target)).resolves.toBe("skipped");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 });

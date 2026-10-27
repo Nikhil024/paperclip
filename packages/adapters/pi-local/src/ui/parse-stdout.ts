@@ -61,7 +61,8 @@ export function parsePiStdoutLine(line: string, ts: string): TranscriptEntry[] {
     type === "extension_ui_request" ||
     type === "extension_ui_response" ||
     type === "extension_error" ||
-    type === "paperclip_progress"
+    type === "paperclip_progress" ||
+    type === "thinking_level_changed"
   ) {
     return [];
   }

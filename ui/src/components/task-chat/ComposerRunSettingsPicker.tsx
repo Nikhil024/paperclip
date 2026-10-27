@@ -166,7 +166,7 @@ export function ComposerRunSettingsPicker({
   const filteredModels = models.filter((item) =>
     `${item.label} ${item.id}`.toLowerCase().includes(query.toLowerCase()));
   const exactMatch = models.some((item) => item.id.toLowerCase() === query.toLowerCase());
-  const needsProvider = agent && (["opencode_local", "pi_local", "kimi_local"].includes(agent.adapterType)
+  const needsProvider = agent && (["opencode_local", "pi_local", "omp_local", "kimi_local"].includes(agent.adapterType)
     || (agent.adapterType === "paperclip_runner" && provider === "opencode"));
   const manualValid = query.length > 0 && !/\s/.test(query)
     && (!needsProvider || /^[^/]+\/.+[^/]$/.test(query))
@@ -242,7 +242,7 @@ export function ComposerRunSettingsPicker({
           <label htmlFor="composer-run-effort" data-testid="selected-effort" className="composer-run-settings-accent min-w-0 flex-1 text-center text-sm font-medium">{effortLabel}</label>
           <button type="button" aria-label="Reset to agent default" title="Reset to agent default" disabled={!changed} onClick={reset} className="grid size-8 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-accent disabled:opacity-40"><RotateCcw className="size-4" /></button>
         </div>
-        <input id="composer-run-effort" type="range" min={0} max={choices.length} step={1} value={effortIndex} aria-label={agent?.adapterType === "pi_local" ? "Thinking" : "Effort"} aria-valuetext={effortLabel}
+        <input id="composer-run-effort" type="range" min={0} max={choices.length} step={1} value={effortIndex} aria-label={agent?.adapterType === "pi_local" || agent?.adapterType === "omp_local" ? "Thinking" : "Effort"} aria-valuetext={effortLabel}
           onChange={(event) => {
             const nextEffort = Number(event.target.value) === 0 ? null : choices[Number(event.target.value) - 1]!;
             rememberComposerEffort(companyId, nextEffort);

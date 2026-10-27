@@ -4358,13 +4358,23 @@ export function writePaperclipSkillSyncPreference(
   return next;
 }
 
+// Windows directory symlinks need admin or Developer Mode; a junction does not,
+// but it requires an absolute target.
+async function linkSkillPath(source: string, target: string): Promise<void> {
+  if (process.platform === "win32") {
+    const isDirectory = await fs.stat(source).then((stat) => stat.isDirectory()).catch(() => false);
+    if (isDirectory) {
+      await fs.symlink(path.resolve(source), target, "junction");
+      return;
+    }
+  }
+  await fs.symlink(source, target);
+}
+
 export async function ensurePaperclipSkillSymlink(
   source: string,
   target: string,
-  linkSkill: (source: string, target: string) => Promise<void> = (
-    linkSource,
-    linkTarget,
-  ) => fs.symlink(linkSource, linkTarget),
+  linkSkill: (source: string, target: string) => Promise<void> = linkSkillPath,
 ): Promise<"created" | "repaired" | "skipped"> {
   const existing = await fs.lstat(target).catch(() => null);
   if (!existing) {

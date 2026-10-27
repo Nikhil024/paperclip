@@ -10,6 +10,7 @@ import { AgentRunnerSelect } from "../AgentRunnerSelect";
 import { SelectPopover } from "../ui/select";
 import { DEFAULT_CODEX_LOCAL_MODEL } from "@paperclipai/adapter-codex-local";
 import {
+  isPiFamilyAdapter,
   SETUP_CREDENTIAL_KEYS,
   SETUP_LOGIN_HINTS,
   setupEfforts,
@@ -52,6 +53,7 @@ import { environmentDisplayLabel } from "@/lib/managed-sandbox-environment";
 import { buildNewAgentRuntimeConfig } from "@/lib/new-agent-runtime-config";
 import {
   PROVIDER_ENV_KEYS,
+  piCustomProviderEnv,
   storeProviderApiKey,
   storeOrganizationApiKey,
 } from "@/lib/provider-credential";
@@ -148,7 +150,7 @@ function Setup({
       ? brandType
       : null;
   const multiProvider =
-    brandType === "opencode_local" || brandType === "pi_local";
+    brandType === "opencode_local" || isPiFamilyAdapter(brandType);
   const providerKeys = setupProviderKeys(brandType);
   const chooseProvider = multiProvider || brandType === "hermes_local";
   const hasCredentialField =
@@ -156,6 +158,8 @@ function Setup({
   const showModel = !isDot && !["cursor_cloud", "hermes_gateway"].includes(adapterType);
   const [allowUnmeteredProvider, setAllowUnmeteredProvider] = useState(false);
   const [gatewayUrl, setGatewayUrl] = useState("");
+  const [piBaseUrl, setPiBaseUrl] = useState("");
+  const [piContextWindow, setPiContextWindow] = useState("");
   const [kimiModel, setKimiModel] = useState("");
   const [kimiBaseUrl, setKimiBaseUrl] = useState("");
   const [kimiProtocol, setKimiProtocol] = useState("kimi");
@@ -487,6 +491,19 @@ function Setup({
       else
         config.env = { ...((config.env as object) ?? {}), [envKey]: binding };
     }
+    if (isPiFamilyAdapter(adapterType)) {
+      // A typed key is bound to envKey on save (and sent as a test credential).
+      const keyBound =
+        !aiBinding && !nextConnection?.aiConnection && hasCredentialField &&
+        Boolean(binding || apiKey.trim());
+      const piEnv = piCustomProviderEnv(
+        model,
+        piBaseUrl,
+        keyBound ? envKey : null,
+        piContextWindow.trim() ? Number(piContextWindow) : null,
+      );
+      if (piEnv) config.env = { ...((config.env as object) ?? {}), ...piEnv };
+    }
     if (adapterType === "cursor_cloud")
       Object.assign(config, {
         repoUrl: repository.trim(),
@@ -516,6 +533,12 @@ function Setup({
     if (isDot && !allowUnmeteredProvider) throw new Error("Acknowledge external provider billing before creating your Dot agent.");
     if (multiProvider && (!model.trim() || !model.includes("/")))
       throw new Error("Choose or enter a model in provider/model format.");
+    if (
+      isPiFamilyAdapter(adapterType) &&
+      piContextWindow.trim() &&
+      !/^[1-9]\d*$/.test(piContextWindow.trim())
+    )
+      throw new Error("Context window must be a positive whole number of tokens.");
     if (
       adapterType === "cursor_cloud" &&
       !/^https:\/\/github\.com\/[^/]+\/[^/]+/.test(repository.trim())
@@ -1197,7 +1220,12 @@ function Setup({
                                   value={provider}
                                   onChange={(event) => {
                                     setProvider(event.target.value);
-                                    setModel("");
+                                    // Keep custom models; clear only one tied to the old provider.
+                                    if (
+                                      !piBaseUrl.trim() &&
+                                      model.startsWith(`${provider}/`)
+                                    )
+                                      setModel("");
                                     setApiKey("");
                                     setProviderBinding(null);
                                     resetTest();
@@ -1298,7 +1326,10 @@ function Setup({
                             <p className="text-xs text-muted-foreground sm:col-span-2">
                               New keys are saved as organization secrets when
                               you finish setup.
-                              {multiProvider && ` Use a ${provider}/model ID.`}
+                              {multiProvider &&
+                                (isPiFamilyAdapter(adapterType) && piBaseUrl.trim()
+                                  ? " Use name/model — the part before “/” names your custom provider (e.g. spark/qwen3)."
+                                  : ` Use a ${provider}/model ID.`)}
                             </p>
                           </div>
                         )}
@@ -1314,6 +1345,42 @@ function Setup({
                               placeholder="https://hermes.example.com"
                             />
                           </Field>
+                        )}
+                        {isPiFamilyAdapter(adapterType) && (
+                          <div className="grid gap-5 sm:grid-cols-2">
+                            <Field
+                              label="Base URL"
+                              hint="Optional. Route this provider through a custom OpenAI-compatible endpoint."
+                            >
+                              <Input
+                                aria-label="Base URL"
+                                value={piBaseUrl}
+                                onChange={(event) => {
+                                  setPiBaseUrl(event.target.value);
+                                  resetTest();
+                                }}
+                                placeholder="https://your-endpoint/v1"
+                              />
+                            </Field>
+                            <Field
+                              label="Context window (tokens)"
+                              hint="Optional. Your model's max context length."
+                            >
+                              <Input
+                                aria-label="Context window (tokens)"
+                                type="number"
+                                min={1}
+                                step={1}
+                                inputMode="numeric"
+                                value={piContextWindow}
+                                onChange={(event) => {
+                                  setPiContextWindow(event.target.value);
+                                  resetTest();
+                                }}
+                                placeholder="65536"
+                              />
+                            </Field>
+                          </div>
                         )}
                         {usingKimiApi && (
                           <div className="grid gap-5 sm:grid-cols-2">

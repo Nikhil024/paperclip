@@ -101,7 +101,7 @@ vi.mock("./models.js", async () => {
   };
 });
 
-import { execute } from "./execute.js";
+import { execute, readSessionHeaderCwd } from "./execute.js";
 
 describe("pi remote execution", () => {
   const cleanupDirs: string[] = [];
@@ -887,5 +887,22 @@ describe("pi remote execution", () => {
 
     expect(result.summary).toBe("Hello 😀");
     expect(result.resultJson).toEqual({ stdout: rawStdout, stderr: "diagnostic stderr\n" });
+  });
+});
+
+describe("readSessionHeaderCwd", () => {
+  const session = JSON.stringify({ type: "session", cwd: "/work/repo" });
+
+  it("reads the cwd from a Pi session file (session header first)", () => {
+    expect(readSessionHeaderCwd(`${session}\n{"type":"message"}\n`)).toBe("/work/repo");
+  });
+
+  it("reads the cwd from an omp session file (title record before the session header)", () => {
+    expect(readSessionHeaderCwd(`{"type":"title","title":"t"}\n${session}\n`)).toBe("/work/repo");
+  });
+
+  it("returns null when no session header appears within the first 5 lines", () => {
+    const filler = Array.from({ length: 5 }, () => '{"type":"title"}').join("\n");
+    expect(readSessionHeaderCwd(`${filler}\n${session}\n`)).toBeNull();
   });
 });

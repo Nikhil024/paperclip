@@ -1,1 +1,4 @@
+# Hash-verified build inputs (runner protocol manifest, replay goldens) break
+# on CRLF checkouts, so every text file is LF in the working tree too.
+* text=auto eol=lf
 patches/*.patch whitespace=-space-before-tab

@@ -60,13 +60,12 @@ import { isPiUnknownSessionError, parsePiJsonl, createPiJsonlParser } from "./pa
 import { createPiStdoutCompactor, resolvePiStdoutLogMode } from "./stdout-compaction.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
+import { resolvePiSkillsHome } from "./skills.js";
+import { buildPiRunArgs, PI_VARIANT, resolveOmpSessionFile, type PiVariant } from "./variant.js";
 import { preparePiOpenRouterExtension } from "./openrouter-extension.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
-
-const PAPERCLIP_SESSIONS_DIR = path.join(os.homedir(), ".pi", "paperclips");
-const PI_AGENT_SKILLS_DIR = path.join(os.homedir(), ".pi", "agent", "skills");
 
 function firstNonEmptyLine(text: string): string {
   return (
@@ -92,6 +91,7 @@ function parseModelId(model: string | null): string | null {
 }
 
 async function ensurePiSkillsInjected(
+  skillsDir: string,
   onLog: AdapterExecutionContext["onLog"],
   skillsEntries: Array<{ key: string; runtimeName: string; source: string }>,
   desiredSkillNames?: string[],
@@ -99,32 +99,32 @@ async function ensurePiSkillsInjected(
   const desiredSet = new Set(desiredSkillNames ?? skillsEntries.map((entry) => entry.key));
   const selectedEntries = skillsEntries.filter((entry) => desiredSet.has(entry.key));
   if (selectedEntries.length === 0) return;
-  await fs.mkdir(PI_AGENT_SKILLS_DIR, { recursive: true });
+  await fs.mkdir(skillsDir, { recursive: true });
   const removedSkills = await removeMaintainerOnlySkillSymlinks(
-    PI_AGENT_SKILLS_DIR,
+    skillsDir,
     selectedEntries.map((entry) => entry.runtimeName),
   );
   for (const skillName of removedSkills) {
     await onLog(
       "stderr",
-      `[paperclip] Removed maintainer-only Pi skill "${skillName}" from ${PI_AGENT_SKILLS_DIR}\n`,
+      `[paperclip] Removed maintainer-only Pi skill "${skillName}" from ${skillsDir}\n`,
     );
   }
 
   for (const entry of selectedEntries) {
-    const target = path.join(PI_AGENT_SKILLS_DIR, entry.runtimeName);
+    const target = path.join(skillsDir, entry.runtimeName);
 
     try {
       const result = await ensurePaperclipSkillSymlink(entry.source, target);
       if (result === "skipped") continue;
       await onLog(
         "stderr",
-        `[paperclip] ${result === "repaired" ? "Repaired" : "Injected"} Pi skill "${entry.runtimeName}" into ${PI_AGENT_SKILLS_DIR}\n`,
+        `[paperclip] ${result === "repaired" ? "Repaired" : "Injected"} Pi skill "${entry.runtimeName}" into ${skillsDir}\n`,
       );
     } catch (err) {
       await onLog(
         "stderr",
-        `[paperclip] Failed to inject Pi skill "${entry.runtimeName}" into ${PI_AGENT_SKILLS_DIR}: ${err instanceof Error ? err.message : String(err)}\n`,
+        `[paperclip] Failed to inject Pi skill "${entry.runtimeName}" into ${skillsDir}: ${err instanceof Error ? err.message : String(err)}\n`,
       );
     }
   }
@@ -148,14 +148,9 @@ function resolvePiBiller(env: Record<string, string>, provider: string | null): 
   return provider === "openai" ? inferOpenAiCompatibleBiller(env, "openai") ?? "unknown" : provider ?? "unknown";
 }
 
-async function ensureSessionsDir(): Promise<string> {
-  await fs.mkdir(PAPERCLIP_SESSIONS_DIR, { recursive: true });
-  return PAPERCLIP_SESSIONS_DIR;
-}
-
-function buildSessionPath(agentId: string, timestamp: string): string {
+function buildSessionPath(sessionsDir: string, agentId: string, timestamp: string): string {
   const safeTimestamp = timestamp.replace(/[:.]/g, "-");
-  return path.join(PAPERCLIP_SESSIONS_DIR, `${safeTimestamp}-${agentId}.jsonl`);
+  return path.join(sessionsDir, `${safeTimestamp}-${agentId}.jsonl`);
 }
 
 function buildRemoteSessionPath(runtimeRootDir: string, agentId: string, timestamp: string): string {
@@ -171,20 +166,20 @@ function executionCwdsMatch(saved: string, current: string, remote: boolean): bo
   return normalizeExecutionCwd(saved, remote) === normalizeExecutionCwd(current, remote);
 }
 
-function readSessionHeaderCwd(raw: string): string | null {
-  const headerLine = raw
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean);
-  if (!headerLine) return null;
-  try {
-    const parsed = JSON.parse(headerLine) as Record<string, unknown>;
-    if (parsed.type !== "session") return null;
-    const cwd = typeof parsed.cwd === "string" ? parsed.cwd.trim() : "";
-    return cwd.length > 0 ? cwd : null;
-  } catch {
-    return null;
+export function readSessionHeaderCwd(raw: string): string | null {
+  // Pi writes the session header first; omp writes a `title` record before it.
+  for (const line of raw.split(/\r?\n/).slice(0, 5)) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (parsed.type !== "session") continue;
+      const cwd = typeof parsed.cwd === "string" ? parsed.cwd.trim() : "";
+      return cwd.length > 0 ? cwd : null;
+    } catch {
+      return null;
+    }
   }
+  return null;
 }
 
 async function readSavedSessionCwd(input: {
@@ -225,7 +220,10 @@ async function readSavedSessionCwd(input: {
   }
 }
 
-export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+export async function execute(
+  ctx: AdapterExecutionContext,
+  variant: PiVariant = PI_VARIANT,
+): Promise<AdapterExecutionResult> {
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
   const executionTarget = readAdapterExecutionTarget({
@@ -241,7 +239,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   );
   const hasCustomPromptTemplate = asString(config.promptTemplate, "").trim().length > 0;
-  const command = asString(config.command, "pi");
+  const command = asString(config.command, variant.command);
+  const sessionsDir = path.join(os.homedir(), variant.homeDirName, "paperclips");
+  const hostSkillsDir = resolvePiSkillsHome(config, variant);
   const model = asString(config.model, "").trim();
   const thinking = asString(config.thinking, "").trim();
   const stdoutLogMode = resolvePiStdoutLogMode(config);
@@ -270,14 +270,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
 
   if (!executionTargetIsRemote) {
-    await ensureSessionsDir();
+    await fs.mkdir(sessionsDir, { recursive: true });
   }
 
   const piSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredPiSkillNames = resolveLegacyPaperclipDesiredSkillNames(config, piSkillEntries);
-  if (!executionTargetIsRemote) {
-    await ensurePiSkillsInjected(onLog, piSkillEntries, desiredPiSkillNames);
-  }
 
   // Build environment
   const envConfig = parseObject(config.env);
@@ -338,15 +335,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Materialize custom Pi providers (PAPERCLIP_PI_PROVIDERS) into a managed
   // PI_CODING_AGENT_DIR before runtimeEnv is computed, so both local validation
   // and the spawned Pi process resolve models against the managed models.json.
-  const preparedRuntimeConfig = await preparePiRuntimeConfig({ env });
+  const preparedRuntimeConfig = await preparePiRuntimeConfig({ env, modelsFileName: variant.modelsFileName });
   const localAgentConfigDir = preparedRuntimeConfig.agentConfigDir ?? "";
   if (localAgentConfigDir) {
     env.PI_CODING_AGENT_DIR = localAgentConfigDir;
   }
+  // omp has no --skill flag and only discovers skills in the agent dir it runs
+  // with, which is the managed dir when custom providers are injected.
+  const localSkillsHome =
+    variant.type === "omp_local" && localAgentConfigDir
+      ? path.join(localAgentConfigDir, "skills")
+      : hostSkillsDir;
   let attributionExtension: Awaited<ReturnType<typeof preparePiOpenRouterExtension>> | undefined;
   try {
     attributionExtension = await preparePiOpenRouterExtension();
     let attributionExtensionPath = attributionExtension.extensionPath;
+    if (!executionTargetIsRemote) {
+      await ensurePiSkillsInjected(localSkillsHome, onLog, piSkillEntries, desiredPiSkillNames);
+    }
     // Prepend installed skill `bin/` dirs to PATH so an agent's bash tool can
     // invoke skill binaries (e.g. `paperclip-get-issue`) by name. Without this,
     // any pi_local agent whose AGENTS.md calls a skill command via bash hits
@@ -408,6 +414,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         command,
         cwd,
         env: runtimeEnv,
+        variant,
       });
     }
 
@@ -552,7 +559,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? runtimeSessionId
       : executionTargetIsRemote && remoteRuntimeRootDir
         ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
-        : buildSessionPath(agent.id, new Date().toISOString());
+        : buildSessionPath(sessionsDir, agent.id, new Date().toISOString());
 
     if (runtimeSessionId && !canResumeSession) {
       const staleSessionCwdNote =
@@ -576,7 +583,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           graceSec: 5,
           onLog,
         });
-      } else {
+      } else if (variant.freshSession === "session-path") {
         try {
           await fs.writeFile(sessionPath, "", { flag: "wx" });
         } catch (err) {
@@ -653,32 +660,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return notes;
     })();
 
-    const buildArgs = (sessionFile: string, userPrompt: string): string[] => {
-      const args: string[] = [];
-
-      // Use JSON mode for structured output with print mode (non-interactive)
-      args.push("--mode", "json");
-      args.push("-p"); // Non-interactive mode: process prompt and exit
-
-      // Use --append-system-prompt to extend Pi's default system prompt
-      args.push("--append-system-prompt", renderedSystemPromptExtension);
-
-      if (provider) args.push("--provider", provider);
-      if (modelId) args.push("--model", modelId);
-      if (thinking) args.push("--thinking", thinking);
-
-      args.push("--tools", "read,bash,edit,write,grep,find,ls");
-      args.push("--session", sessionFile);
-      args.push("--skill", remoteSkillsDir ?? PI_AGENT_SKILLS_DIR);
-
-      if (extraArgs.length > 0) args.push(...extraArgs);
-      args.push("--extension", attributionExtensionPath);
-
-      // Add the user prompt as the last argument
-      args.push(userPrompt);
-
-      return args;
-    };
+    const buildArgs = (sessionFile: string, resumeSession: boolean, userPrompt: string): string[] =>
+      buildPiRunArgs(variant, {
+        systemPrompt: renderedSystemPromptExtension,
+        provider,
+        modelId,
+        thinking,
+        sessionFile,
+        resumeSession,
+        // omp_local is not enabled for remote targets, so remoteSkillsDir is Pi-only.
+        skillsDir: remoteSkillsDir ?? localSkillsHome,
+        // Both pi and omp accept --extension; the OpenRouter attribution
+        // extension rides along after the configured extra args.
+        extraArgs: [...extraArgs, "--extension", attributionExtensionPath],
+        userPrompt,
+      });
 
     const runAttempt = async (sessionFile: string) => {
       const attemptResumedSession = canResumeSession && sessionFile === sessionPath;
@@ -717,10 +713,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         sessionHandoffChars: sessionHandoffNote.length,
         heartbeatPromptChars: attemptRenderedHeartbeatPrompt.length,
       };
-      const args = buildArgs(sessionFile, userPrompt);
+      const args = buildArgs(sessionFile, attemptResumedSession, userPrompt);
       if (onMeta) {
         await onMeta({
-          adapterType: "pi_local",
+          adapterType: variant.type,
           command: resolvedCommand,
           cwd: effectiveExecutionCwd,
           commandNotes,
@@ -795,7 +791,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed.usage = retained.usage;
         parsed.sawAgentEnd = retained.sawAgentEnd;
       }
-      return { proc, rawStderr: proc.stderr, parsed };
+      // omp names a fresh session file itself; the path we asked for only
+      // supplied the directory. Null when omp never opened a session.
+      const resolvedSessionFile =
+        variant.freshSession === "session-dir" && !attemptResumedSession
+          ? resolveOmpSessionFile(proc.stdout, path.dirname(sessionFile))
+          : sessionFile;
+      return { proc, rawStderr: proc.stderr, parsed, sessionFile: resolvedSessionFile };
     };
 
     const toResult = (
@@ -803,6 +805,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
         parsed: ReturnType<typeof parsePiJsonl>;
+        sessionFile: string | null;
       },
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {
@@ -818,7 +821,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         };
       }
 
-      const resolvedSessionId = clearSessionOnMissingSession ? null : sessionPath;
+      const resolvedSessionId = clearSessionOnMissingSession ? null : attempt.sessionFile;
       const resolvedSessionParams = resolvedSessionId
         ? {
             sessionId: resolvedSessionId,
@@ -838,7 +841,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const rawExitCode = attempt.proc.exitCode;
       const parsedError = attempt.parsed.errors.find((error) => error.trim().length > 0) ?? "";
       const effectiveExitCode = (rawExitCode ?? 0) === 0 && parsedError ? 1 : rawExitCode;
-      const fallbackErrorMessage = parsedError || stderrLine || `Pi exited with code ${rawExitCode ?? -1}`;
+      const fallbackErrorMessage = parsedError || stderrLine || `${variant.label} exited with code ${rawExitCode ?? -1}`;
 
       return {
         exitCode: effectiveExitCode,
@@ -889,7 +892,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         );
         const newSessionPath = executionTargetIsRemote && remoteRuntimeRootDir
           ? buildRemoteSessionPath(remoteRuntimeRootDir, agent.id, new Date().toISOString())
-          : buildSessionPath(agent.id, new Date().toISOString());
+          : buildSessionPath(sessionsDir, agent.id, new Date().toISOString());
         if (executionTargetIsRemote) {
           await ensureAdapterExecutionTargetFile(runId, executionTarget, newSessionPath, {
             cwd,
@@ -898,7 +901,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             graceSec: 5,
             onLog,
           });
-        } else {
+        } else if (variant.freshSession === "session-path") {
           try {
             await fs.writeFile(newSessionPath, "", { flag: "wx" });
           } catch (err) {
