@@ -1,6 +1,7 @@
 import { MUSE_ASSET_VERSION, museStopBoundarySchema, museDetectorCleanupAttestationSchema, createGrokInvitationSchema, configureGrokRoutineSchema, verifyGrokRoutineSchema, recoverGrokRoutineSchema, pairGrokBindingSchema, stopGrokWorkSchema, retryGrokDeliverySchema, updateFastResponseSchema } from "@paperclipai/shared";
 import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema } from "@paperclipai/shared";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
+import { agentCaseHandoffSchema, caseWorkflowDocumentTextSchema, doneCaseHandoffSchema, createWorkflowSchema, updateWorkflowSchema, listWorkflowsSchema, readWorkflowQuerySchema } from "@paperclipai/shared";
 import {
   experimentalApiPaths,
   experimentalApiQueries,
@@ -13,6 +14,7 @@ import {
   toggleAllGitHubRepositoriesSchema,
   createAiConnectionSchema,
   updateDecisionModelSchema,
+  updatePromptInjectionPreventionSchema,
   updateAgentObservabilitySchema,
   agentObservabilityRevisionSchema,
   agentObservabilityCaptureSchema,
@@ -46,6 +48,7 @@ import {
   updateAgentSchema,
   updatePrimaryAgentSchema,
   updateAgentPermissionsSchema,
+  addAgentProjectAccessSchema,
   updateAgentInstructionsPathSchema,
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
@@ -65,6 +68,7 @@ import {
   resetAgentSessionSchema,
   agentSkillSyncSchema,
   testAdapterEnvironmentSchema,
+  qualifyAgentRunnerSchema,
   // Issue
   createIssueSchema,
   setIssueTitleSchema,
@@ -247,6 +251,8 @@ import {
   // Issue recovery and decomposition
   createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
+  recoverWorkspaceSchema,
+  taskRetrySchema,
   retryWorkspaceExportSchema,
   reconstructWorkspaceSchema,
   resumeWorkspaceFinalizationSchema,
@@ -1385,6 +1391,14 @@ const browserUseOperations = [
 ] as const;
 
 const BOARD_ONLY_OPERATIONS = new Set([
+  "GET /api/agents/{id}/project-access",
+  "POST /api/agents/{id}/project-access",
+  "POST /api/issues/{id}/interactions/{interactionId}/dismiss",
+  "POST /api/issues/{id}/retry",
+  "GET /api/companies/{companyId}/prompt-injection-prevention",
+  "PUT /api/companies/{companyId}/prompt-injection-prevention",
+  "GET /api/companies/{companyId}/prompt-injection-prevention/models",
+  "POST /api/companies/{companyId}/prompt-injection-prevention/test",
   "GET /api/companies/{companyId}/fast-response",
   "PUT /api/companies/{companyId}/fast-response",
   "GET /api/companies/{companyId}/fast-response/models",
@@ -1416,6 +1430,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
 
   "GET /api/companies/{companyId}/project-repositories",
   "PUT /api/projects/{id}/repositories",
+  "GET /api/projects/{id}/git-authorization",
+  "PUT /api/projects/{id}/git-authorization",
   "DELETE /api/issues/{id}/documents/{key}",
   "GET /api/companies/{companyId}/decisions",
   "GET /api/cloud/stacks",
@@ -3779,6 +3795,26 @@ registry.registerPath({
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
+const agentProjectAccessResponse = z.object({ projectIds: z.array(z.string().uuid()), canManage: z.boolean() });
+registry.registerPath({
+  method: "get",
+  path: "/api/agents/{id}/project-access",
+  tags: ["agents"],
+  summary: "Read an agent's allowed projects and the current operator's management capability",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(agentProjectAccessResponse), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/project-access",
+  tags: ["agents"],
+  summary: "Add allowed projects without replacing an agent's other permissions",
+  description: "Requires board access and agents:create in the agent's company. Accepts 1 to 100 project IDs. Selected projects must be readable and in that company. Locks the low-trust agent, preserves existing containment, audits new additions, and rejects pending-approval agents or changed trust settings. Repeated additions are idempotent. Saving does not start or retry a task.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(addAgentProjectAccessSchema) },
+  responses: { 200: r.ok(agentProjectAccessResponse), 400: r.badRequest, 401: r.unauthorized,
+    403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
 registry.registerPath({
   method: "patch",
   path: "/api/agents/{id}/instructions-path",
@@ -4121,6 +4157,16 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/agents/{id}/qualify-runner",
+  tags: ["agents"],
+  summary: "Qualify an existing agent's saved computer for a runner upgrade",
+  description: "Requires agent_config:update authorization, normally agents:configure. Resolves the saved agent's effective sandbox; expectedEnvironmentId only guards against stale UI state. Does not change the agent or grant instance environment access.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(qualifyAgentRunnerSchema) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict, 422: r.unprocessable },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/adapters/{type}/auth-signal",
   tags: ["adapters"],
@@ -4225,10 +4271,15 @@ registry.registerPath({
   tags: ["issues"],
   summary: "List issues in a company",
   description:
-    "Use `view=compact` for the board issue-list row contract. The default response remains the broad compatibility contract.",
+    "Use view=index for collection membership/order without task bodies or diagnostic enrichment; view=rows enriches visible rows without task bodies. These responses include listProjection and cannot stand in for a full issue. view=compact retains the board row compatibility contract. The default response remains the broad compatibility contract. All projections enforce company and task access.",
   request: {
     params: z.object({ companyId: z.string() }),
-    query: z.object({ view: z.enum(["compact"]).optional() }).passthrough(),
+    query: z.object({
+      view: z.enum(["compact", "index", "rows"]).optional(),
+      ids: z.string().optional().describe("One to 100 comma-separated task UUIDs; requires index or rows without attention."),
+      parentIds: z.string().optional().describe("One to 100 comma-separated parent UUIDs; requires index or rows without attention."),
+      oneChildPerParent: z.boolean().optional().describe("Return at most one readable child per parent; requires view=index and parentIds."),
+    }).passthrough(),
   },
   responses: {
     200: r.ok(),
@@ -4273,7 +4324,7 @@ registry.registerPath({
   path: "/api/issues/{id}",
   tags: ["issues"],
   summary: "Get an issue",
-  request: { params: z.object({ id: z.string() }) },
+  request: { params: z.object({ id: z.string() }), query: z.object({ view: z.literal("core").optional().describe("Core task fields without related enrichment.") }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
 
@@ -4293,7 +4344,7 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads.",
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. For a prepared backlog task, send exactly status=todo and expectedStatusVersion from the task response. The locked promotion returns 409 if the status or assignment changed. Other mutation fields with this guard return 422.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateIssueSchema.partial()),
@@ -4303,6 +4354,7 @@ registry.registerPath({
     400: r.badRequest,
     401: r.unauthorized,
     404: r.notFound,
+    409: r.conflict,
     422: r.unprocessable,
   },
 });
@@ -4577,6 +4629,16 @@ registry.registerPath({
     body: jsonBody(restoreIssueDocumentRevisionSchema),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/issues/{id}/recent-comments",
+  tags: ["issues"],
+  summary: "Read a bounded recent task exchange",
+  description: "Returns four recent comments, the latest human comment, and the first human instruction when the task has no description. Includes latestCommentId and hasMore. Uses the same authorization and redaction as full comment reads.",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({
@@ -4942,6 +5004,25 @@ registry.registerPath({
     401: r.unauthorized,
     403: r.forbidden,
   },
+});
+
+const projectGitAuthorizationResponse = z.object({
+  grantId: z.string().uuid().nullable(),
+  authorizedByUserId: z.string().nullable(),
+  options: z.array(z.object({ grantId: z.string().uuid(), connectionName: z.string(), login: z.string() })),
+});
+registry.registerPath({
+  method: "get", path: "/api/projects/{id}/git-authorization", tags: ["projects"],
+  summary: "Read background project GitHub authorization and the viewer's eligible grants",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(projectGitAuthorizationResponse), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+registry.registerPath({
+  method: "put", path: "/api/projects/{id}/git-authorization", tags: ["projects"],
+  summary: "Authorize or revoke a personal GitHub grant for background project work",
+  description: "Board project workspace writers can select only their own active company-installed grant. No task authority or token is stored.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(z.object({ grantId: z.string().uuid().nullable() }).strict()) },
+  responses: { 200: r.ok(projectGitAuthorizationResponse), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({
@@ -5701,7 +5782,7 @@ registry.registerPath({
   path: "/api/companies/{companyId}/agent-commentary",
   tags: ["agents"],
   summary: "Browse agent suggestions and complaints",
-  description: "Board-only. Requires company membership, audit:view_agent_actions. Source-task privacy filters both previews and counts. Returns items, total, limit and offset; previews contain at most 280 characters and omit full bodies.",
+  description: "Board-only. Requires company membership and commentary:view, granted by default to all human company roles. Source-task privacy filters both previews and counts. Returns items, total, limit and offset; previews contain at most 280 characters and omit full bodies.",
   request: { params: z.object({ companyId: z.string() }), query: agentCommentaryQuerySchema },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
@@ -6035,8 +6116,11 @@ registry.registerPath({
   path: "/api/issues/{id}/activity",
   tags: ["activity"],
   summary: "List activity for an issue",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: { params: z.object({ id: z.string() }), query: z.object({
+    view: z.enum(["recent", "comment-inputs"]).optional().describe("Recent activity (at most 50 rows), or original comment/steering facts for selected comments."),
+    commentIds: z.string().optional().describe("For comment-inputs: up to 100 comma-separated comment UUIDs. Returns at most two original facts per comment."),
+  }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
@@ -6044,7 +6128,7 @@ registry.registerPath({
   path: "/api/issues/{id}/runs",
   tags: ["activity"],
   summary: "List runs for an issue",
-  request: { params: z.object({ id: z.string() }) },
+  request: { params: z.object({ id: z.string() }), query: z.object({ view: z.literal("recent").optional().describe("At most two recent run summaries.") }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
@@ -6893,8 +6977,9 @@ registry.registerPath({
   path: "/api/instance/settings/experimental",
   tags: ["instance"],
   summary: "Update experimental instance settings",
+  description: "Requires instance-admin access or a trusted Cloud stack admin. Operator-hidden settings and Cloud-managed feature restrictions still apply. This does not grant access to other instance administration operations.",
   request: { body: jsonBody(patchInstanceExperimentalSettingsSchema) },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -7418,6 +7503,7 @@ registry.registerPath({
       agentId: z.string().optional(),
       limit: z.coerce.number().int().min(1).max(1000).default(200),
       summary: z.enum(["true", "false", "1", "0"]).optional(),
+      latestFailuresOnly: z.enum(["true", "false"]).optional().describe("Return failures only when the agent's latest run within the bounded result failed or timed out. Applied before read redaction."),
     }),
   },
   responses: { 200: r.ok(), 401: r.unauthorized },
@@ -7775,7 +7861,11 @@ registry.registerPath({
   path: "/api/heartbeat-runs/{runId}/events",
   tags: ["runs"],
   summary: "Get events for a heartbeat run",
-  request: { params: z.object({ runId: heartbeatRunIdParamSchema }) },
+  request: { params: z.object({ runId: heartbeatRunIdParamSchema }), query: z.object({
+      view: z.literal("conversation").optional().describe("Assistant text and request lifecycle events, excluding historical tool activity."),
+      afterSeq: z.coerce.number().int().min(0).optional(),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+    }) },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
@@ -7784,7 +7874,14 @@ registry.registerPath({
   path: "/api/heartbeat-runs/{runId}/log",
   tags: ["runs"],
   summary: "Get log for a heartbeat run",
-  request: { params: z.object({ runId: heartbeatRunIdParamSchema }) },
+  request: {
+    params: z.object({ runId: heartbeatRunIdParamSchema }),
+    query: z.object({
+      offset: z.coerce.number().int().min(0).optional(),
+      limitBytes: z.coerce.number().int().min(1).max(1024 * 1024).optional(),
+      alignStartToRecord: z.enum(["true", "false"]).optional().describe("Extend the tail backward to include its first complete log record. The response can exceed limitBytes by that record's prefix."),
+    }),
+  },
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
@@ -10696,6 +10793,24 @@ registerCurrentRoute({
 
 registerCurrentRoute({
   method: "post",
+  path: "/api/issues/{id}/retry",
+  tags: ["issues"],
+  summary: "Request one durable task retry from current input and preserved results",
+  body: taskRetrySchema,
+  responses: { 200: r.ok(), 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/recovery-actions/recover-workspace",
+  tags: ["issues"],
+  summary: "Request safe recovery of a retained workspace without restarting the source turn",
+  body: recoverWorkspaceSchema,
+  responses: { 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
+});
+
+registerCurrentRoute({
+  method: "post",
   path: "/api/issues/{id}/recovery-actions/resume-workspace-finalization",
   tags: ["issues"],
   summary: "Resume a saved native result after operator verification of the prior workspace owner's stop",
@@ -10749,6 +10864,13 @@ registerCurrentRoute({
   tags: ["issues"],
   summary: "Cancel an issue question interaction",
   body: cancelIssueThreadInteractionSchema,
+});
+
+registerCurrentRoute({
+  method: "post",
+  path: "/api/issues/{id}/interactions/{interactionId}/dismiss",
+  tags: ["issues"],
+  summary: "Defer a request to conversation history (human board users only)",
 });
 
 registerCurrentRoute({
@@ -11086,6 +11208,20 @@ registerCurrentRoute({
 });
 
 // --- Tool access -------------------------------------------------------------
+
+for (const [method, suffix, summary] of [
+  ["get", "", "Get prompt injection settings and eligible shared OpenRouter connections; non-managers receive no settings or choices"],
+  ["put", "", "Configure opt-in prompt injection model checks as a board connection manager"],
+  ["get", "/models", "List OpenRouter model suggestions for an authorized shared connection as a board connection manager"],
+  ["post", "/test", "Classify two fixed billed samples using saved settings as a board connection manager; fallback is not a passing model test"],
+] as const) registerCurrentRoute({
+  method, path: `/api/companies/{companyId}/prompt-injection-prevention${suffix}`,
+  tags: ["prompt-injection-prevention"], summary,
+  ...(method === "put" ? { body: updatePromptInjectionPreventionSchema } : {}),
+  ...(method === "post" ? { body: z.object({}).strict() } : {}),
+  ...(suffix === "/models" ? { query: z.object({ connectionId: z.string().uuid() }) } : {}),
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 422: r.unprocessable },
+});
 
 for (const [method, suffix, summary] of [
   ["get", "", "Get fast response settings and compatible shared API connections"],
@@ -12480,6 +12616,42 @@ registerCurrentRoute({
 
 // Every experimental REST route remains discoverable while its runtime feature
 // flag and actor checks stay authoritative. Shared validators prevent drift.
+// OpenAPI 3.0 cannot represent the shared validator's conditional refinement.
+// Derive separate creation/existing branches so discovery marks workflow text
+// required for case.create without requiring it for ordinary phase transfers.
+const caseHandoffApiBodySchema = z.union([
+  agentCaseHandoffSchema.safeExtend({ case: agentCaseHandoffSchema.shape.case.options[1], workflow_document_text: caseWorkflowDocumentTextSchema }),
+  agentCaseHandoffSchema.safeExtend({ case: agentCaseHandoffSchema.shape.case.options[1], workflowId: z.string().uuid() }),
+  agentCaseHandoffSchema.safeExtend({ case: agentCaseHandoffSchema.shape.case.options[0] }),
+  doneCaseHandoffSchema,
+]);
+registry.registerPath({ method: "post", path: "/api/companies/{companyId}/case-handoffs", tags: ["Cases"],
+  summary: "Start or hand off a case using its primary task",
+  description: "Requires enableCases and standard work mode. Kickoff requires either workflowId or workflow_document_text. Workflows are reusable name-and-prompt definitions; phases are free text. On later agent handoffs, omit workflowId to preserve instructions, supply an ID to adopt its latest prompt (including refresh of the current ID), or null to detach while keeping instructions. Acceptance snapshots the selected prompt. Transfer applies workflow, phase and task-document revision together after outgoing execution settles; a document revision conflict holds the handoff for recovery. Workflow and other initial document bodies together must total at most 200000 characters. Inline callers remain supported. Current company, case, task assignment, source-trust and run authority apply. Reuses the primary task; self-handoffs also yield. An idempotent replay returns the existing authorized receipt.",
+  request: { params: z.object({ companyId: z.string().uuid() }), body: jsonBody(caseHandoffApiBodySchema) },
+  responses: { 200: r.ok(), 202: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden,
+    404: r.notFound, 409: r.conflict, 422: r.unprocessable } });
+registry.registerPath({ method: "get", path: "/api/cases/{caseId}/handoffs", tags: ["Cases"],
+  summary: "Read a standalone case's handoff history", description: "Requires enableCases and access to all retained case permission sources.",
+  request: { params: z.object({ caseId: z.string().uuid() }), query: z.object({ limit: z.coerce.number().int().min(1).max(100).optional(),
+    before: z.iso.datetime().optional(), cursor: z.string().max(400).optional() }) }, responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound } });
+for (const action of ["retry", "cancel"] as const) registry.registerPath({ method: "post", path: `/api/cases/{caseId}/handoffs/{handoffId}/${action}`,
+  tags: ["Cases"], summary: `${action === "retry" ? "Retry" : "Cancel"} pending case handoff`,
+  description: "Requires case access and ordinary task-control authority. Retry preserves the existing handoff/task identity. Cancellation remains available when enableCases is disabled; it prevents delivery and does not undo an applied assignment.",
+  request: { params: z.object({ caseId: z.string().uuid(), handoffId: z.string().uuid() }) },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict } });
+
+for (const [method, path, body, summary] of [
+  ["get", "/api/companies/{companyId}/workflows", undefined, "List reusable workflow metadata"],
+  ["post", "/api/companies/{companyId}/workflows", createWorkflowSchema, "Create a reusable workflow"],
+  ["get", "/api/workflows/{id}", undefined, "Read a reusable workflow and its Markdown prompt"],
+  ["patch", "/api/workflows/{id}", updateWorkflowSchema, "Update a reusable workflow for future adoptions"],
+] as const) registry.registerPath({ method, path, tags: ["Cases"], summary,
+  description: "Requires enableCases and company access. Definitions are company-shared. Writes enforce the current agent run fence and source-trust policy. Editing a definition does not change existing case task documents. Individual reads return an ETag containing a SHA-256 content fingerprint; pass it without quotes or the optional W/ prefix as snapshot to reject a changed definition with 409.",
+  request: { params: path.includes("{companyId}") ? z.object({ companyId: z.string().uuid() }) : z.object({ id: z.string().uuid() }),
+    ...(body ? { body: jsonBody(body) } : {}), ...(method === "get" ? { query: path.includes("{companyId}") ? listWorkflowsSchema : readWorkflowQuerySchema } : {}) },
+  responses: { [method === "post" ? 201 : 200]: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict } });
+
 for (const [method, path, body] of experimentalApiPaths) {
   const query = experimentalApiQueries[`${method.toUpperCase()} ${path}`];
   const metadata = experimentalApiMetadata[`${method.toUpperCase()} ${path}`];

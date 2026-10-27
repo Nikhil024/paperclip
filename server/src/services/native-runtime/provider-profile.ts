@@ -1,4 +1,4 @@
-import { agentHarnessType } from "@paperclipai/shared";
+import { agentHarnessType, normalizeClaudeRunnerOptions } from "@paperclipai/shared";
 import { resolveClaudeEffort, resolveQualifiedAcpxProfile } from "../../vendor/paperclip-runner/index.js";
 import {
   isPaperclipRunnerProvider,
@@ -31,6 +31,7 @@ export const DEFAULT_ACPX_RUNNER_MODELS = {
   // These profiles require explicit configuration. Admission belongs to the runner.
   codex: null,
   cursor: null,
+  copilot: null,
   pi: null,
 } as const;
 
@@ -83,6 +84,7 @@ export type PaperclipRunnerNativeProviderInput =
       homeMode?: "isolated" | "preconfigured";
       codexApprovalPolicy: "never" | "on-request" | "untrusted";
       codexReasoningEffort?: string;
+      codexWebSearch?: "disabled";
     }
   | {
       provider: "opencode";
@@ -384,6 +386,7 @@ export function assertAgentCoreProfileRecoveryBinding(input: {
 }
 
 export function claudeRunnerUnsupportedSettings(config: Record<string, unknown>): string[] {
+  config = normalizeClaudeRunnerOptions(config).config;
   const unsupported = ["chrome", "agentCommand", "acpAgentCommand", "stateDir", "acpStateDir", "warmHandleIdleMs", "acpWarmHandleIdleMs", "extraArgs", "args", "filesystemScope", "filesystemExtraPaths", "filesystemSandboxCommand", "networkScope", "networkAllowlist", "maxTurnsPerRun", "permissionMode", "acpPermissionMode"]
     .filter(key => config[key] !== undefined && config[key] !== false && config[key] !== "" && config[key] !== 0 && !(Array.isArray(config[key]) && config[key].length === 0));
   if (config.command && config.command !== "claude") unsupported.push("command");
@@ -535,6 +538,9 @@ export function resolvePaperclipRunnerProviderProfile(
   }
 
   const acpxAgent = config.acpxAgent ?? "claude";
+  if (acpxAgent === "copilot" && (!model || ["auto", "default"].includes(model.toLowerCase()))) {
+    throw new PaperclipRunnerProviderProfileError("paperclip_runner_acpx_model_required", "GitHub Copilot requires an explicit model ID; there is no default model.");
+  }
   const pendingAcpxProfile = PAPERCLIP_RUNNER_ACPX_PROFILES.find(profile => profile.value === acpxAgent && !profile.qualified);
   if (pendingAcpxProfile) {
     if (!model) throw new PaperclipRunnerProviderProfileError("paperclip_runner_acpx_model_required", `${pendingAcpxProfile.label} requires an explicit model ID; there is no default model.`);
@@ -554,7 +560,7 @@ export function resolvePaperclipRunnerProviderProfile(
   if ((acpxAgent === "cursor" || acpxAgent === "pi") && !model) {
     throw new PaperclipRunnerProviderProfileError("paperclip_runner_acpx_model_required", "This ACPX agent requires an explicit model ID; there is no default model.");
   }
-  if (acpxAgent !== "claude" && acpxAgent !== "codex" && acpxAgent !== "grok" && acpxAgent !== "cursor" && acpxAgent !== "pi") {
+  if (acpxAgent !== "claude" && acpxAgent !== "codex" && acpxAgent !== "grok" && acpxAgent !== "cursor" && acpxAgent !== "copilot" && acpxAgent !== "pi") {
     throw new PaperclipRunnerProviderProfileError(
       "paperclip_runner_acpx_agent_unavailable",
       "Paperclip Runner ACPX requires a qualified agent profile.",
@@ -838,5 +844,6 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
       config.codexPermissionMode,
     ) as "never" | "on-request" | "untrusted",
     ...(typeof effort === "string" && effort ? { codexReasoningEffort: effort } : {}),
+    ...(config.search === false ? { codexWebSearch: "disabled" as const } : {}),
   };
 }

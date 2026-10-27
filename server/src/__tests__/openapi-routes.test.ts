@@ -14,11 +14,14 @@ const ROUTES_DIR = path.resolve(__dirname, "../routes");
 
 const apiPrefixes: Record<string, string> = {
   "cases.ts": "/api",
+  "case-handoffs.ts": "/api",
+  "workflows.ts": "/api",
   "smoke-lab.ts": "/api",
   "access.ts": "/api",
   "activity.ts": "/api",
   "adapters.ts": "/api",
   "agents.ts": "/api",
+  "agent-project-access.ts": "/api",
   "agent-commentary.ts": "/api",
   "agent-avatars.ts": "/api",
   "agent-profile-avatar.ts": "/api",
@@ -27,6 +30,7 @@ const apiPrefixes: Record<string, string> = {
   "decision-models.ts": "/api",
   "agent-observability.ts": "/api",
   "fast-responses.ts": "/api",
+  "prompt-injection-prevention.ts": "/api",
   "attention.ts": "/api",
   "approvals.ts": "/api",
   "assets.ts": "/api",
@@ -313,8 +317,16 @@ describe("openapi routes", () => {
   it("removes Pipelines discovery while retaining Cases and Routines", () => {
     const spec = buildOpenApiSpec() as any;
     const paths = Object.keys(spec.paths);
-    expect(paths.filter((path) => /pipelines|review-cases|case-events|\{caseId\}/.test(path))).toEqual([]);
+    expect(paths.filter((path) => /pipelines|review-cases|case-events/.test(path))).toEqual([]);
+    // Standalone handoffs also use caseId; that parameter name no longer
+    // identifies a removed Pipeline operation. Retain only their live paths.
+    expect(paths.filter((path) => path.startsWith("/api/cases/{caseId}")).sort()).toEqual([
+      "/api/cases/{caseId}/handoffs",
+      "/api/cases/{caseId}/handoffs/{handoffId}/cancel",
+      "/api/cases/{caseId}/handoffs/{handoffId}/retry",
+    ]);
     expect(spec.paths["/api/companies/{companyId}/cases"].post).toBeDefined();
+    expect(spec.paths["/api/companies/{companyId}/case-handoffs"].post).toBeDefined();
     expect(spec.paths["/api/cases/{id}"].get).toBeDefined();
     expect(spec.paths["/api/routines/{id}/run"].post).toBeDefined();
   });
@@ -454,6 +466,14 @@ describe("openapi routes", () => {
     expect(wake.responses["202"]).toBeDefined();
     expect(wake.responses["409"]).toBeDefined();
     expect(wake.description).toContain("durable queued/deferred receipt");
+  });
+  it("advertises the guarded prepared-task promotion contract to API clients", async () => {
+    const res = await request(createApp()).get("/api/openapi.json");
+    const patch = res.body.paths["/api/issues/{id}"].patch;
+    expect(patch.requestBody.content["application/json"].schema.properties.expectedStatusVersion)
+      .toMatchObject({ type: "integer", minimum: 0 });
+    expect(patch.responses["409"]).toBeDefined();
+    expect(patch.description).toContain("send exactly status=todo and expectedStatusVersion");
   });
   it("serves the generated OpenAPI document", async () => {
     const res = await request(createApp()).get("/api/openapi.json");
@@ -922,6 +942,21 @@ describe("openapi routes", () => {
     expect(decision.requestBody.content["application/json"].schema.required).toEqual(expect.arrayContaining(["approve", "approvalCode"]));
   });
 
+  it("documents board-only prompt injection settings and fixed-sample testing", () => {
+    const { spec } = loadSpecRoutes();
+    const base = "/api/companies/{companyId}/prompt-injection-prevention";
+    for (const [method, suffix] of [["get", ""], ["put", ""], ["get", "/models"], ["post", "/test"]]) {
+      expect(spec.paths[base + suffix][method]["x-paperclip-authorization"]).toEqual({ actor: "board" });
+      expect(spec.paths[base + suffix][method].security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    }
+    expect(spec.paths[base].put.requestBody.content["application/json"].schema).toMatchObject({
+      additionalProperties: false, required: ["enabled", "connectionId", "grantId", "model"],
+    });
+    expect(spec.paths[base + "/test"].post.requestBody.content["application/json"].schema).toMatchObject({
+      type: "object", additionalProperties: false, properties: {},
+    });
+  });
+
   it("covers the mounted server routes exactly", () => {
     const {
       routes: actualRoutes,
@@ -951,6 +986,21 @@ describe("openapi routes", () => {
       extraInSpec: [],
       excludedRoutes: [...explicitOpenApiOperationCoverageExclusions].sort(),
     });
+  });
+
+  it("documents additive project access as board-only with a strict request", () => {
+    const { spec } = loadSpecRoutes();
+    const path = spec.paths["/api/agents/{id}/project-access"];
+    for (const operation of [path.get, path.post]) {
+      expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
+      expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+      expect(operation.responses["200"].content["application/json"].schema.required).toEqual(["projectIds", "canManage"]);
+    }
+    expect(path.post.requestBody.content["application/json"].schema).toMatchObject({
+      additionalProperties: false, required: ["projectIds"],
+      properties: { projectIds: { type: "array", items: { type: "string", format: "uuid" } } },
+    });
+    expect(path.post.responses["409"]).toBeDefined();
   });
 
   it("documents the authenticated personal primary-agent contract", () => {

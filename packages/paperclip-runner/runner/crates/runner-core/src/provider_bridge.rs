@@ -44,6 +44,7 @@ const QUESTION_INPUT_SCHEMA_HINT: &str = "Invalid request_human_input arguments.
 const BLOCK_INPUT_SCHEMA_HINT: &str = "Invalid paperclip_block arguments. Required fields: reportedWorkDisposition=blocked, summary, completionClaim, evidence, verification, and blocker. blocker must include reasonCode, owner, unblockAction, and scope.";
 const MONITOR_INPUT_SCHEMA_HINT: &str = "Invalid set_task_monitor arguments. Supply idempotencyKey and monitor: {nextCheckAt: <future UTC timestamp>, notes: <next check>}. Put all scheduling fields inside monitor, or use monitor: null to clear. Omit taskId for the current task. Correct the arguments and retry.";
 const API_INPUT_SCHEMA_HINT: &str = "Invalid call_api arguments. For responseText, use GET with offsetBytes >= 0 and responseText.limitBytes from 4 through 24576 bytes (default 24576). Follow nextOffsetBytes; null means complete. Correct the arguments and retry.";
+const TOOL_INPUT_SCHEMA_HINT: &str = "Invalid tool arguments. The tool was not executed. Match its authorized input schema. Correct the arguments and retry.";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -248,7 +249,7 @@ impl ProviderBridgeError {
             "request_human_input" => Some(QUESTION_INPUT_SCHEMA_HINT),
             "set_task_monitor" => Some(MONITOR_INPUT_SCHEMA_HINT),
             "call_api" => Some(API_INPUT_SCHEMA_HINT),
-            _ => None,
+            _ => Some(TOOL_INPUT_SCHEMA_HINT),
         };
         Self {
             message: format!("provider arguments for {operation_id} failed JSON Schema validation"),
@@ -257,8 +258,6 @@ impl ProviderBridgeError {
     }
 
     fn with_schema_locations(mut self, validator: &jsonschema::Validator, input: &Value) -> Self {
-        // Only the reserved tools above have a provider-safe hint. Report bounded paths
-        // into the authorized schema, never the submitted values or unknown keys.
         if let Some(message) = self.safe_provider_message.as_mut() {
             let locations = validator
                 .iter_errors(input)
@@ -580,9 +579,15 @@ impl ProviderToolBridge {
 
     pub fn prepare_turn(&mut self) -> Result<(), ProviderBridgeError> {
         if !self.pending.is_empty() || !self.completed.is_empty() {
-            return Err(ProviderBridgeError::invalid(
-                "cannot prepare the next provider turn while tool calls are active",
-            ));
+            // Name the blocking receipts so a recovery that can never start a
+            // turn identifies the stuck call. IDs and operation names only; no
+            // tool input or result content leaves the bridge.
+            return Err(ProviderBridgeError::invalid(format!(
+                "cannot prepare the next provider turn while tool calls are active \
+                 (pending: {}; completed: {})",
+                describe_active_receipts(self.pending.values()),
+                describe_active_receipts(self.completed.values().map(|entry| &entry.call)),
+            )));
         }
         // The authoritative result bodies are needed only while the provider
         // can replay the just-settled turn. Release that bulky data at the
@@ -982,6 +987,27 @@ impl ProviderToolBridge {
             self.retained_result_bytes,
             self.pending.values().chain(additional_pending.into_iter()),
         )
+    }
+}
+
+const MAX_DESCRIBED_ACTIVE_RECEIPTS: usize = 4;
+
+fn describe_active_receipts<'a>(
+    calls: impl ExactSizeIterator<Item = &'a PendingToolCall>,
+) -> String {
+    let total = calls.len();
+    if total == 0 {
+        return "0".to_owned();
+    }
+    let described = calls
+        .take(MAX_DESCRIBED_ACTIVE_RECEIPTS)
+        .map(|call| format!("{}:{}", call.operation_id, call.call_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if total > MAX_DESCRIBED_ACTIVE_RECEIPTS {
+        format!("{total} [{described}, ...]")
+    } else {
+        format!("{total} [{described}]")
     }
 }
 
@@ -1612,7 +1638,9 @@ mod tests {
         );
         let other = ProviderBridgeError::input_schema_validation("some_other_tool")
             .with_schema_locations(&validator, &json!({"a": 1}));
-        assert_eq!(other.safe_provider_message(), None);
+        let message = other.safe_provider_message().unwrap();
+        assert!(message.starts_with(TOOL_INPUT_SCHEMA_HINT));
+        assert!(message.contains("/properties/a/type"));
     }
 
     #[test]
@@ -2150,6 +2178,47 @@ mod tests {
                 json!({}),
             )
             .expect("a new durable run resets the full legacy ledger");
+    }
+
+    #[test]
+    fn active_receipts_that_block_the_next_turn_are_named() {
+        let mut bridge = completion_bridge();
+        bridge
+            .begin_call(
+                "stuck-call".to_owned(),
+                "paperclip_finish".to_owned(),
+                json!({"summary": "private summary text"}),
+            )
+            .unwrap();
+
+        let message = bridge
+            .prepare_turn()
+            .expect_err("a pending call blocks the next turn")
+            .to_string();
+        assert!(message.contains("tool calls are active"));
+        assert!(message.contains("pending: 1 [paperclip_finish:stuck-call]"));
+        assert!(message.contains("completed: 0"));
+        assert!(!message.contains("private summary text"));
+
+        bridge
+            .apply_result(ToolResult {
+                call_id: "stuck-call".to_owned(),
+                operation_id: "paperclip_finish".to_owned(),
+                result: json!({"ok": true}),
+                is_error: false,
+            })
+            .unwrap();
+        let message = bridge
+            .prepare_turn()
+            .expect_err("an unsettled completed call blocks the next turn")
+            .to_string();
+        assert!(message.contains("pending: 0;"));
+        assert!(message.contains("completed: 1 [paperclip_finish:stuck-call]"));
+
+        bridge.settle_turn("provider_turn_terminated").unwrap();
+        bridge
+            .prepare_turn()
+            .expect("settled receipts no longer block the turn");
     }
 
     #[test]

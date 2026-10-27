@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AdapterModel } from "@paperclipai/adapter-utils";
-import { asString, runChildProcess } from "@paperclipai/adapter-utils/server-utils";
+import { asString, runChildProcess, sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
 import { PI_VARIANT, type PiVariant } from "./variant.js";
 
 const MODELS_CACHE_TTL_MS = 60_000;
@@ -133,7 +133,7 @@ export async function discoverPiModels(input: {
   const listing = `${variant.command} ${variant.listModelsArgs.join(" ")}`;
   const cwd = asString(input.cwd, process.cwd());
   const env = normalizeEnv(input.env);
-  const runtimeEnv = normalizeEnv({ ...process.env, ...env });
+  const runtimeEnv = normalizeEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env });
 
   const result = await runChildProcess(
     `pi-models-${Date.now()}-${Math.random().toString(16).slice(2)}`,

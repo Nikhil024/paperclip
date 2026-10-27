@@ -23,12 +23,13 @@ import {
   renameSync,
   unlinkSync,
   writeFileSync,
-  type Stats,
 } from "node:fs";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { dirname, resolve } from "node:path";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
+import { withStagedPrivateWrite } from "./staged-private-write.js";
+import { verifyPrivateRegularFile } from "./private-state-file.js";
 
 import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
 import { ACPX_CREDENTIAL_BINDING_ENV, ACPX_CREDENTIAL_NAMES, CLAUDE_ROUTING_ENV_KEYS, createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
@@ -46,8 +47,10 @@ import {
 } from "./prp-transport-types.js";
 
 const protocol = "paperclip.runner";
-const protocolMinVersion = 1;
-const protocolVersion = 3;
+export const RUNNER_PRP_PROTOCOL_MIN = 1;
+const protocolMinVersion = RUNNER_PRP_PROTOCOL_MIN;
+export const RUNNER_PRP_PROTOCOL_MAX = 3;
+const protocolVersion = RUNNER_PRP_PROTOCOL_MAX;
 const secureFrameSchema = "paperclip.runner.secure-frame.v1";
 const websocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const coreStateSchema = "paperclip.runner.durable.control-plane-state.v1";
@@ -292,10 +295,11 @@ export interface RunnerProcessHandle {
   startedAt?: string;
   isExitConfirmed?(): boolean;
   /** Relaunches the same immutable process specification with a fresh ticket. */
-  restart?(ticket: string): RunnerProcessHandle;
+  restart?: ((ticket: string) => RunnerProcessHandle) | null;
 }
 
 export type RunnerProcessConnection =
+  | { mode: "external" }
   | { mode: "connect"; connectUrl: string; caBundlePath?: string }
   | {
       mode: "listen";
@@ -305,6 +309,8 @@ export type RunnerProcessConnection =
     };
 
 export interface RunnerProcessLaunchSpec {
+  /** Structured data for process owners. Plugins never receive the shell specification. */
+  nativeRunner?: Omit<Parameters<typeof spawnRunner>[0], "processLauncher" | "runnerBinaryPath" | "environment" | "connectUrl">;
   command: string;
   args: readonly string[];
   cwd: string;
@@ -1117,23 +1123,7 @@ function verifyPrivateDirectory(path: string): void {
   }
 }
 
-function verifyPrivateRegularFile(file: Stats, path: string): void {
-  if (!file.isFile()) {
-    throw new Error(`Private state path is not a regular file: ${path}`);
-  }
-  if (process.platform !== "win32") {
-    if ((file.mode & 0o777) !== 0o600) {
-      throw new Error(`Private state file does not use mode 0600: ${path}`);
-    }
-    if (process.geteuid !== undefined && file.uid !== process.geteuid()) {
-      throw new Error(
-        `Private state file is not owned by the daemon user: ${path}`,
-      );
-    }
-  }
-}
-
-function readPrivateFile(path: string): string | null {
+export function readPrivateFile(path: string): string | null {
   let descriptor: number;
   try {
     descriptor = openSync(
@@ -1171,7 +1161,7 @@ function syncParentDirectory(path: string): void {
   }
 }
 
-function atomicPrivateWrite(path: string, contents: string): void {
+export function atomicPrivateWrite(path: string, contents: string): void {
   const temporary = resolve(
     dirname(path),
     `.${path.split(/[\\/]/).at(-1)}.${randomUUID()}.tmp`,
@@ -1213,6 +1203,12 @@ class DurableCoreStore {
   readonly path: string;
   #state: StoredCoreState;
   #writeIndeterminate = false;
+  #revision = 0;
+  #pendingEvent: {
+    buildCandidate: (state: StoredCoreState) => StoredCoreState | null;
+    isCurrentOwner: () => boolean;
+    committed: boolean;
+  } | null = null;
 
   constructor(directory: string, identity: DurableRecoveryIdentity) {
     try {
@@ -1250,7 +1246,54 @@ class DurableCoreStore {
 
   save(): void {
     this.assertWritable();
-    atomicPrivateWrite(this.path, `${JSON.stringify(this.#state, null, 2)}\n`);
+    ++this.#revision;
+    try {
+      const pending = this.#pendingEvent;
+      // A command already needs a synchronous write. Include the admitted
+      // event there, rather than invalidating and repeating its full write.
+      const withEvent = pending && !pending.committed && pending.isCurrentOwner()
+        ? pending.buildCandidate(this.#state) : null;
+      const candidate = withEvent ?? this.#state;
+      atomicPrivateWrite(this.path, `${JSON.stringify(candidate)}\n`);
+      this.#state = candidate;
+      if (pending && withEvent) pending.committed = true;
+    } catch (error) {
+      this.#writeIndeterminate = true;
+      throw error;
+    }
+  }
+
+  /** Stage event state privately; publish it only after its durable commit. */
+  async commitEvent(
+    buildCandidate: (state: StoredCoreState) => StoredCoreState | null,
+    isCurrentOwner: () => boolean,
+  ): Promise<boolean> {
+    if (!isCurrentOwner()) return false;
+    const pending = { buildCandidate, isCurrentOwner, committed: false };
+    this.#pendingEvent = pending;
+    try {
+      this.assertWritable();
+      const revision = this.#revision;
+      const candidate = buildCandidate(this.#state);
+      if (candidate === null) return false;
+      await withStagedPrivateWrite(this.path, `${JSON.stringify(candidate)}\n`, (temporary) => {
+        this.assertWritable();
+        if (pending.committed || !isCurrentOwner() || this.#revision !== revision) return;
+        renameSync(temporary, this.path);
+        syncParentDirectory(this.path);
+        this.#state = candidate;
+        ++this.#revision;
+        pending.committed = true;
+      });
+      // Explicit authority commits do not absorb pending events. On conflict,
+      // leave the event unacknowledged for replay instead of rewriting in a loop.
+      return pending.committed;
+    } catch (error) {
+      this.#writeIndeterminate = true;
+      throw error;
+    } finally {
+      if (this.#pendingEvent === pending) this.#pendingEvent = null;
+    }
   }
 
   assertWritable(): void {
@@ -1263,8 +1306,12 @@ class DurableCoreStore {
   /** Persist a complete candidate before publishing any new authority in memory. */
   commit(candidate: StoredCoreState): void {
     this.assertWritable();
+    // An explicit authority transaction owns its complete snapshot. Later
+    // command writes must not absorb an event admitted before that boundary.
+    this.#pendingEvent = null;
+    ++this.#revision;
     try {
-      atomicPrivateWrite(this.path, `${JSON.stringify(candidate, null, 2)}\n`);
+      atomicPrivateWrite(this.path, `${JSON.stringify(candidate)}\n`);
       this.#state = candidate;
     } catch (error) {
       // Rename may already have succeeded before directory fsync failed.
@@ -2736,7 +2783,8 @@ export class DurablePrpControlPlane {
           phase: "activated",
         };
         candidate.leases = { [lease.credentialId]: structuredClone(lease) };
-        candidate.runAttachTemplate = this.#store.state.runAttachTemplate;
+        const { paperclipNextAuthority: _authority, ...runAttachTemplate } = transition.command.payload;
+        candidate.runAttachTemplate = structuredClone(runAttachTemplate);
         this.#store.commit(candidate);
         this.#identity = structuredClone(candidate.identity);
         lease = this.#store.state.leases[lease.credentialId]!;
@@ -3258,35 +3306,51 @@ export class DurablePrpControlPlane {
       return;
     }
 
-    if (existing !== undefined) {
-      existing.deliveryCount += 1;
-      this.#store.state.replayDeliveries += 1;
-    } else {
-      if (this.#store.state.committedEvents.length >= maxCommittedEventWindow) {
-        // The awaited business commit may allow another authenticated owner
-        // or a tool completion to advance the window. Re-evaluate, never use
-        // an index sampled before that await to delete a different input.
-        const currentEviction = this.#store.state.committedEvents.findIndex(
-          (candidate) => !unsettledSemanticInput(candidate, this.#store.state),
-        );
-        if (currentEviction < 0) {
-          connection.close();
-          return;
-        }
-        this.#store.state.committedEvents.splice(currentEviction, 1);
+    const buildCandidate = (state: StoredCoreState): StoredCoreState | null => {
+      const committedEvents = [...state.committedEvents];
+      const replayIndex = committedEvents.findIndex(
+        (candidate) => candidate.sourceEventId === sourceEventId,
+      );
+      if (replayIndex >= 0) {
+        const replay = committedEvents[replayIndex];
+        committedEvents[replayIndex] = {
+          ...replay,
+          deliveryCount: replay.deliveryCount + 1,
+        };
+        return { ...state, committedEvents, replayDeliveries: state.replayDeliveries + 1 };
       }
-      this.#store.state.committedEvents.push({
-        sourceSeq,
-        sourceEventId,
-        eventType,
-        priority,
-        envelope: structuredClone(envelope),
-        deliveryCount: 1,
-        logicalEffectCount: 1,
+      if (sourceSeq !== state.ackedSourceSeq + 1) return null;
+      if (committedEvents.length >= maxCommittedEventWindow) {
+        // A command can settle an input while this snapshot is staged. Use
+        // the current response ledger to select an event that can be evicted.
+        const currentEviction = committedEvents.findIndex(
+          (candidate) => !unsettledSemanticInput(candidate, state),
+        );
+        if (currentEviction < 0) return null;
+        committedEvents.splice(currentEviction, 1);
+      }
+      committedEvents.push({
+        sourceSeq, sourceEventId, eventType, priority,
+        envelope: structuredClone(envelope), deliveryCount: 1, logicalEffectCount: 1,
       });
-      this.#store.state.ackedSourceSeq = sourceSeq;
+      return { ...state, committedEvents, ackedSourceSeq: sourceSeq };
+    };
+    const isCurrentOwner = () => this.#eventOwner === connection &&
+      this.#identity === identity && this.#protocolIntegrityError === null;
+    if (priority === 0 || isSemanticInput || eventType.startsWith("turn.") || eventType.startsWith("run.")) {
+      // Critical lifecycle suffixes and tool admission must finish in this
+      // turn before readers react or a replacement owner adopts their cursor.
+      const candidate = buildCandidate(this.#store.state);
+      if (candidate === null) {
+        connection.close();
+        return;
+      }
+      this.#store.commit(candidate);
+    } else if (!await this.#store.commitEvent(buildCandidate, isCurrentOwner)) {
+      if (isCurrentOwner()) connection.close();
+      return;
     }
-    this.#store.save();
+    if (!isCurrentOwner()) return;
 
     if (
       isSemanticInput &&
@@ -3553,8 +3617,9 @@ export function spawnRunner(options: {
       : null);
   if (connection === null)
     throw new Error("runner process connection is required");
+  if (connection.mode === "external" && !options.processLauncher) throw new Error("External Runner connection requires a process owner");
   const connectionArgs =
-    connection.mode === "connect"
+    connection.mode === "external" ? [] : connection.mode === "connect"
       ? [
           "--connect-url",
           connection.connectUrl,
@@ -3654,7 +3719,7 @@ export function spawnRunner(options: {
 
   const command = options.runnerBinaryPath ?? runnerBinary;
   const environment = runnerEnvironment(options.ticket, options.identity.normalizedSessionId, options.environment);
-  const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => ({
+  const withRestart = (handle: RunnerProcessHandle): RunnerProcessHandle => handle.restart === null ? handle : ({
     ...handle,
     restart: (ticket) => {
       if (handle.isExitConfirmed?.() === false) {
@@ -3665,7 +3730,17 @@ export function spawnRunner(options: {
   });
   if (options.processLauncher !== undefined) {
     return withRestart(
-      options.processLauncher({ command, args, cwd: packageRoot, environment }),
+      options.processLauncher({ command, args, cwd: packageRoot, environment,
+        nativeRunner: {
+          identity: options.identity, ticket: options.ticket, connection, stateDirectory: options.stateDirectory,
+          runnerVersion: options.runnerVersion, runnerDigest: options.runnerDigest,
+          maxOutboxBytes: options.maxOutboxBytes, p0ReserveBytes: options.p0ReserveBytes,
+          maxRuntimeMs: options.maxRuntimeMs, maxLifetimeMs: options.maxLifetimeMs,
+          reconnectGraceMs: options.reconnectGraceMs, lifecyclePolicy: options.lifecyclePolicy,
+          acpxLaunchProfile: options.acpxLaunchProfile, opencodeLaunchProfile: options.opencodeLaunchProfile,
+          diagnosticsDirectory: options.diagnosticsDirectory,
+        },
+      }),
     );
   }
 

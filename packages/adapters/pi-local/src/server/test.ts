@@ -7,6 +7,7 @@ import {
   asString,
   parseObject,
   ensurePathInEnv,
+  sanitizeInheritedPaperclipEnv,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   asStringArray,
@@ -130,12 +131,15 @@ export async function testEnvironment(
   for (const [key, value] of Object.entries(envConfig)) {
     if (typeof value === "string") env[key] = value;
   }
+  const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env }));
+
   // Materialize PAPERCLIP_PI_PROVIDERS like execute.ts so local model checks and
   // the hello probe see custom providers. Remote targets are left unchanged.
   const preparedRuntimeConfig = targetIsRemote ? null : await preparePiRuntimeConfig({ env, modelsFileName: variant.modelsFileName });
   if (preparedRuntimeConfig?.agentConfigDir) env.PI_CODING_AGENT_DIR = preparedRuntimeConfig.agentConfigDir;
   try {
-    const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...process.env, ...env }));
+    const runtimeEnv = normalizeEnv(ensurePathInEnv({ ...sanitizeInheritedPaperclipEnv(process.env), ...env }));
+
 
     const cwdInvalid = checks.some((check) => check.code === "pi_cwd_invalid");
     if (cwdInvalid) {
